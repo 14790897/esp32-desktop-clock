@@ -18,6 +18,7 @@
 #include <netdb.h>
 #include <sys/socket.h>
 
+#include <cstring>
 #include <ctime>
 
 #include "gif_player.h"
@@ -93,13 +94,69 @@ constexpr int H_SECOND = 30;
 constexpr int Y_DATE = 184;
 constexpr int H_DATE = 26;
 
-// 把文字缩放到恰好铺满 maxW，避免依赖具体字体的像素尺寸
-void fitWidth(const lgfx::IFont* font, const char* text, int maxW) {
+// 上一帧画过的内容，用于比对出变化的字位
+char gPrevTime[8] = {};
+char gPrevSecond[8] = {};
+
+// 清空比对缓存，强制下一次整行重画（切回时钟、GIF 播完等场景用）
+void invalidateClockText() {
+  memset(gPrevTime, 0, sizeof(gPrevTime));
+  memset(gPrevSecond, 0, sizeof(gPrevSecond));
+}
+
+// 定长字符串按固定字位绘制，且只重画真正变化的字位。
+//
+// 原来每次都是「整块 fillRect 清空 → 重绘」，清完到画完之间有肉眼可见的黑屏，
+// 每走一秒闪一次。改成按字位比对后，每秒只动一个字符，每分钟只动一两个。
+//
+// 固定字位还顺带解决另一个问题：FreeSansBold24pt7b 是比例字体，原先用
+// drawCenterString 按实际宽度居中，"11:11" 比 "00:00" 窄，位置会左右抖。
+// 现在字位宽度固定，数字变化时不会移动。
+//
+// 字位宽度必须取「字符集里最宽的字形」，不能取整串平均值 —— 比例字体里冒号
+// 远窄于数字，平均值会小于数字实际宽度，数字就溢出到相邻字位，被对方的清屏
+// 切掉一两列，屏幕上表现为数字边缘出现一道细线。
+//
+// targetW > 0 时把整串缩放到该宽度，否则用字体原始尺寸。
+void drawSlotString(const lgfx::IFont* font, const char* text, const char* charset, int y,
+                    int h, uint16_t fg, int targetW, char* prev) {
+  const int len = static_cast<int>(strlen(text));
+  if (len <= 0) return;
+
   lcd.setFont(font);
   lcd.setTextSize(1.0f);
-  const int32_t w = lcd.textWidth(text);
-  const float s = (w > 0) ? static_cast<float>(maxW) / static_cast<float>(w) : 1.0f;
-  lcd.setTextSize(s, s);
+
+  int32_t advance = 0;  // 字符集内最宽的字形推进量
+  for (const char* p = charset; *p != '\0'; ++p) {
+    const char ch[2] = {*p, '\0'};
+    const int32_t w = lcd.textWidth(ch);
+    if (w > advance) advance = w;
+  }
+  if (advance <= 0) return;
+
+  int slotW = advance;
+  if (targetW > 0) {
+    const float scale = static_cast<float>(targetW) / static_cast<float>(advance * len);
+    lcd.setTextSize(scale, scale);
+    slotW = static_cast<int>(static_cast<float>(advance) * scale);
+  }
+  if (slotW <= 0) return;
+  const int x0 = (W - slotW * len) / 2;
+
+  lcd.setTextColor(fg);
+  for (int i = 0; i < len; ++i) {
+    if (text[i] == prev[i]) continue;
+
+    const int x = x0 + i * slotW;
+    lcd.fillRect(x, y, slotW, h, COL_BG);
+
+    // 每个字符在自己的字位里居中，冒号这类窄字符才不会挤向一侧
+    const char ch[2] = {text[i], '\0'};
+    const int glyphW = lcd.textWidth(ch);
+    lcd.drawString(ch, x + (slotW - glyphW) / 2, y);
+
+    prev[i] = text[i];
+  }
 }
 
 void drawStatus(uint16_t color, const char* msg) {
@@ -117,20 +174,15 @@ void drawStatus(uint16_t color, const char* msg) {
 void drawTime(int hour, int minute) {
   char buf[8];
   snprintf(buf, sizeof(buf), "%02d:%02d", hour, minute);
-  lcd.fillRect(0, Y_TIME, W, H_TIME, COL_BG);
-  fitWidth(&fonts::FreeSansBold24pt7b, "00:00", W - 16);
-  lcd.setTextColor(COL_TIME, COL_BG);
-  lcd.drawCenterString(buf, W / 2, Y_TIME);
+  drawSlotString(&fonts::FreeSansBold24pt7b, buf, "0123456789:", Y_TIME, H_TIME, COL_TIME,
+                 W - 16, gPrevTime);
 }
 
 void drawSecond(int sec) {
   char buf[8];
   snprintf(buf, sizeof(buf), ":%02d", sec);
-  lcd.fillRect(0, Y_SECOND, W, H_SECOND, COL_BG);
-  lcd.setFont(&fonts::FreeSans12pt7b);
-  lcd.setTextSize(1.0f);
-  lcd.setTextColor(COL_SECOND, COL_BG);
-  lcd.drawCenterString(buf, W / 2, Y_SECOND);
+  drawSlotString(&fonts::FreeSans12pt7b, buf, "0123456789:", Y_SECOND, H_SECOND, COL_SECOND, 0,
+                 gPrevSecond);
 }
 
 void drawDate(const struct tm& t) {
@@ -331,7 +383,8 @@ void initStorage() {
 volatile uint32_t gButtonClicks = 0;
 
 void onButtonSingleClick(void*, void*) {
-  ++gButtonClicks;
+  // volatile 上的 ++ 在 C++20 已废弃，显式读改写
+  gButtonClicks = gButtonClicks + 1;
 }
 
 // 板子上 GPIO12/13 接着指示灯。这两脚在 ESP32-C3 上默认是内部 flash 的
@@ -415,6 +468,7 @@ void clockTask(void*) {
         gifPlay(lcd, kGifPath);
         lcd.fillScreen(COL_BG);
         lastHour = lastMinute = lastSecond = lastDay = -1;  // 强制整屏重画时钟
+        invalidateClockText();
         redrawStatusIndicator();
       }
     }
@@ -424,6 +478,7 @@ void clockTask(void*) {
         reminderActive = false;
         lcd.fillScreen(COL_BG);
         lastHour = lastMinute = lastSecond = lastDay = -1;  // 强制整屏重画
+        invalidateClockText();
         redrawStatusIndicator();
       }
       vTaskDelay(pdMS_TO_TICKS(200));
