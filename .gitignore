@@ -1,0 +1,11 @@
+.pio/
+.vscode/
+include/secrets.h
+
+# 第三方库不进仓库（合计 158MB）。克隆后需按 platformio.ini 顶部的说明
+# 自行下载到 lib/，否则编译不过。
+lib/
+
+# PlatformIO 自动生成，勿纳入版本控制
+sdkconfig.esp32c3-clock
+src/CMakeLists.txt
