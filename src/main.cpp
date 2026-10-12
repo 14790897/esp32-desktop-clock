@@ -216,16 +216,49 @@ void drawStatus(uint16_t color, const char* msg) {
   }
 }
 
+// 精灵这条绘制路径在 R/B 通道上是反的。实测方式：在字幕行画 5 个已知色块
+// （红 绿 蓝 白 灰），观察到的是「蓝 绿 红 白 灰」—— 红蓝对调、绿白灰正常，
+// 是通道顺序问题而非字节序（灰的 R/B 值相同，若是字节序它也会变）。
+// 设备直绘那条路正常（GIF 帧缓冲走 pushImageDMA 颜色是对的），只有精灵不一样，
+// 所以按元件个补偿：送进去之前先把 R 和 B 换一次，显示出来就正了。
+// 换屏幕/换库版本后若颜色又不对，先用 drawColorTest() 重测再改这里。
+uint16_t forSprite(uint16_t rgb565) {
+  return static_cast<uint16_t>(((rgb565 & 0x001F) << 11) | (rgb565 & 0x07E0) |
+                               ((rgb565 & 0xF800) >> 11));
+}
+
+// 颜色校准诊断：在字幕行画 5 个纯色块，用来确定颜色管线做了什么变换。
+// 正常顺序应为 红 绿 蓝 白 灰。看到别的顺序就能反推：
+//   蓝 粉 绿 白 灰 → 字节序颠倒
+//   蓝 绿 红 白 灰 → R/B 通道颠倒（forSprite 就是为这种补偿的）
+// 换屏幕或升级 LovyanGFX 后颜色不对时，用 -DTICKER_COLOR_TEST 编译一次，
+// 按实际看到的顺序调整 forSprite()。
+void drawColorTest() {
+  if (!gTickerSpriteReady) return;
+  static const uint16_t kCols[5] = {0xF800, 0x07E0, 0x001F, 0xFFFF, 0x8410};
+  const int bw = W / 5;
+  gTickerSprite.fillRect(0, 0, W, H_STATUS, COL_BG);
+  for (int i = 0; i < 5; ++i) {
+    gTickerSprite.fillRect(i * bw, 0, bw, H_STATUS, forSprite(kCols[i]));
+  }
+  gTickerSprite.pushSprite(0, Y_STATUS);
+}
+
 // 按当前内容绘制定长字幕。尾巴对齐 —— 右边缘位置固定，文字变长时旧内容自然被
 // 顶出屏幕左侧，新内容始终可见。
 void drawTicker() {
   if (!gTickerSpriteReady) return;
 
+#ifdef TICKER_COLOR_TEST
+  drawColorTest();
+  return;
+#endif
+
   gTickerSprite.fillRect(0, 0, W, H_STATUS, COL_BG);
   if (gTickerActive) {
     gTickerSprite.setFont(&fonts::efontCN_24);
     gTickerSprite.setTextSize(1.0f);
-    gTickerSprite.setTextColor(claudeColor());
+    gTickerSprite.setTextColor(forSprite(claudeColor()));
     gTickerSprite.drawString(gTickerText, W - kTickerIndent - gTickerTextW, (H_STATUS - 24) / 2);
   }
   gTickerSprite.pushSprite(0, Y_STATUS);
@@ -459,6 +492,10 @@ esp_err_t handleState(httpd_req_t* req) {
     } else {
       gClaudeState = ClaudeState::Done;  // "done" 及任何其它值都视为已完成
     }
+    // 状态只影响字幕颜色，不改文字，但同样得触发重画 —— 否则颜色会停在旧值。
+    // Stop 时先发 /say 再发 /state，若中间时钟任务醒过一次而这里不置脏，
+    // 屏幕上就永远差最后那一次变色。
+    if (gTickerActive) gTickerDirty = true;
   }
   httpd_resp_sendstr(req, "ok");
   return ESP_OK;
@@ -677,6 +714,11 @@ void redrawTopRow() {
 // 内容有更新时重算宽度并重画。只在 clockTask 里调用。
 // 宽度算法放在锁内，和 HTTP 线程的追加互斥；drawTicker 在锁外，避免持锁做绘制。
 void refreshTicker() {
+#ifdef TICKER_COLOR_TEST
+  drawTicker();  // 诊断模式：每轮都重画色块，压过网络状态提示
+  return;
+#endif
+
   if (!gTickerDirty || gTickerLock == nullptr) return;
 
   xSemaphoreTake(gTickerLock, portMAX_DELAY);
