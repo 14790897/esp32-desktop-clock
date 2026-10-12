@@ -121,14 +121,28 @@ static const Reminder kReminders[] = {
 ICS 网段）。如果你的网络不是这个网段，把 `src/main.cpp` 里的 `#define CLOCK_USE_STATIC_IP`
 注释掉退回 DHCP，烧录后从串口日志读实际 IP。
 
-**2. 建 hook 配置。** 把模板复制成 `.claude/settings.local.json`：
+**2. 建 hook 配置。** 模板在 `tools/claude-hooks.example.json`，两种装法：
+
+**只在本项目生效**（模板默认按这个写，用 `${CLAUDE_PROJECT_DIR}` 定位脚本）：
 
 ```bash
 cp tools/claude-hooks.example.json .claude/settings.local.json
 ```
 
-（该文件被 `.gitignore` 排除，所以不会随仓库分发 —— 别人克隆后不会平白多出一个
-指向不存在设备的本地服务。要启用就得显式复制一次。）
+**在任意项目都生效**（时钟放桌上时更实用 —— 你在别的仓库干活它也照样显示）。
+把整段 `hooks` 合并进 `~/.claude/settings.json`，并把脚本路径改成**绝对路径**
+（全局配置里 `${CLAUDE_PROJECT_DIR}` 会展开成当前项目，不是这个项目）：
+
+```json
+{ "hooks": { "MessageDisplay": [
+  { "hooks": [ { "type": "command", "command": "python",
+      "args": ["C:/git-program/esp32-clock/tools/claude-status-hook.py"] } ] } ] } }
+```
+
+> **两种装法只能选一个。** 同时配会让每轮推送两次。
+
+> 项目级文件被 `.gitignore` 排除，不会随仓库分发 —— 别人克隆后不会平白多出一个
+> 指向不存在设备的本地服务。要启用就得显式装一次。
 
 **3. 时钟地址不是默认值时**，设环境变量：
 

@@ -92,25 +92,30 @@ def main() -> None:
 
     event = payload.get("hook_event_name", "")
 
+    # 带上会话标识。多开会话时它们都往同一个字幕推，设备靠这个区分：
+    # 换了会话就清空重来，否则两个会话的输出会接成一句读不通的话。
+    sid = payload.get("session_id") or ""
+    q = f"?sid={sid}" if sid else ""
+
     if event == "MessageDisplay":
         # 逐批追加，不截断 —— 设备端自己会丢掉超出缓冲的老内容
         delta = flatten(payload.get("delta") or "")
         if delta:
-            post("/append", delta)
+            post("/append" + q, delta)
 
     elif event == "UserPromptSubmit":
-        post("/state", "working")
+        post("/state" + q, "working")
 
     elif event == "Stop":
         # 流式过程中已经追加过了，这里用完整文本兜底替换一次，
         # 保证最终内容完整（万一有批次丢了）
         text = flatten(payload.get("last_assistant_message") or "")
         if text:
-            post("/say", tail(text, MAX_CHARS))
-        post("/state", "done")
+            post("/say" + q, tail(text, MAX_CHARS))
+        post("/state" + q, "done")
 
     elif event == "StopFailure":
-        post("/state", "failed")
+        post("/state" + q, "failed")
 
 
 if __name__ == "__main__":

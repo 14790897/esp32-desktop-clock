@@ -125,6 +125,7 @@ uint16_t claudeColor() {
 }
 
 char gTickerText[kTickerCap] = {};   // 显示缓冲。HTTP 线程持锁写，clockTask 只读
+char gTickerSession[48] = {};        // 当前内容属于哪个会话，换了会话要清空重来
 volatile bool gTickerDirty = false;  // 有新内容，等 clockTask 重算宽度并重画
 volatile bool gTickerActive = false;
 int gTickerTextW = 0;  // 文本总宽，内容变化时重算一次
@@ -438,8 +439,20 @@ int readBody(httpd_req_t* req, char* buf, int cap) {
   return total;
 }
 
-void replaceTickerText(const char* s, int len) {
+// 换了会话就把缓冲清掉。多开会话时它们都往同一个字幕推，不清的话
+// A 的输出会接上 B 的输出，屏幕上是一串拼接起来的话。调用方须已持锁。
+void switchSessionIfNeeded(const char* sid) {
+  if (sid == nullptr || sid[0] == '\0') return;
+  if (strncmp(sid, gTickerSession, sizeof(gTickerSession) - 1) == 0) return;
+
+  strncpy(gTickerSession, sid, sizeof(gTickerSession) - 1);
+  gTickerSession[sizeof(gTickerSession) - 1] = '\0';
+  gTickerText[0] = '\0';
+}
+
+void replaceTickerText(const char* sid, const char* s, int len) {
   if (len <= 0 || xSemaphoreTake(gTickerLock, pdMS_TO_TICKS(50)) != pdTRUE) return;
+  switchSessionIfNeeded(sid);
   if (len > kTickerCap - 1) len = kTickerCap - 1;
   memcpy(gTickerText, s, len);
   gTickerText[len] = '\0';
@@ -449,8 +462,10 @@ void replaceTickerText(const char* s, int len) {
 
 // 追加到末尾。满了从前面丢，保证新内容一定进得来 —— 尾巴对齐的显示方式下，
 // 被丢掉的老内容本来就已经滚出屏幕左侧了。
-void appendTickerText(const char* s, int len) {
+void appendTickerText(const char* sid, const char* s, int len) {
   if (len <= 0 || xSemaphoreTake(gTickerLock, pdMS_TO_TICKS(50)) != pdTRUE) return;
+
+  switchSessionIfNeeded(sid);
 
   int cur = static_cast<int>(strlen(gTickerText));
   if (cur + len > kTickerCap - 1) {
@@ -466,16 +481,28 @@ void appendTickerText(const char* s, int len) {
   xSemaphoreGive(gTickerLock);
 }
 
+// 取 URL 里的 sid 查询参数（?sid=xxx）。没有就返回空串。
+void querySession(httpd_req_t* req, char* out, size_t outLen) {
+  out[0] = '\0';
+  char q[128];
+  if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK) return;
+  if (httpd_query_key_value(q, "sid", out, outLen) != ESP_OK) out[0] = '\0';
+}
+
 esp_err_t handleSay(httpd_req_t* req) {
   char buf[kTickerCap];
-  replaceTickerText(buf, readBody(req, buf, sizeof(buf)));
+  char sid[sizeof(gTickerSession)];
+  querySession(req, sid, sizeof(sid));
+  replaceTickerText(sid, buf, readBody(req, buf, sizeof(buf)));
   httpd_resp_sendstr(req, "ok");
   return ESP_OK;
 }
 
 esp_err_t handleAppend(httpd_req_t* req) {
   char buf[kTickerCap];
-  appendTickerText(buf, readBody(req, buf, sizeof(buf)));
+  char sid[sizeof(gTickerSession)];
+  querySession(req, sid, sizeof(sid));
+  appendTickerText(sid, buf, readBody(req, buf, sizeof(buf)));
   httpd_resp_sendstr(req, "ok");
   return ESP_OK;
 }
@@ -483,20 +510,32 @@ esp_err_t handleAppend(httpd_req_t* req) {
 esp_err_t handleState(httpd_req_t* req) {
   char buf[16] = {};
   const int n = httpd_req_recv(req, buf, sizeof(buf) - 1);
-  if (n > 0) {
-    buf[n] = '\0';
-    if (strncmp(buf, "working", 7) == 0) {
-      gClaudeState = ClaudeState::Working;
-    } else if (strncmp(buf, "failed", 6) == 0) {
-      gClaudeState = ClaudeState::Failed;
-    } else {
-      gClaudeState = ClaudeState::Done;  // "done" 及任何其它值都视为已完成
-    }
-    // 状态只影响字幕颜色，不改文字，但同样得触发重画 —— 否则颜色会停在旧值。
-    // Stop 时先发 /say 再发 /state，若中间时钟任务醒过一次而这里不置脏，
-    // 屏幕上就永远差最后那一次变色。
-    if (gTickerActive) gTickerDirty = true;
+  if (n <= 0) {
+    httpd_resp_sendstr(req, "ok");
+    return ESP_OK;
   }
+  buf[n] = '\0';
+
+  ClaudeState st = ClaudeState::Done;  // "done" 及任何其它值都视为已完成
+  if (strncmp(buf, "working", 7) == 0) {
+    st = ClaudeState::Working;
+  } else if (strncmp(buf, "failed", 6) == 0) {
+    st = ClaudeState::Failed;
+  }
+
+  if (xSemaphoreTake(gTickerLock, pdMS_TO_TICKS(50)) == pdTRUE) {
+    // 状态也要认会话：A 还在输出时，B 的一句「完成」不该把颜色改绿。
+    // 顺带切换当前会话 —— 新一轮开始时清掉上一条，随后流式追加的内容才干净。
+    char sid[sizeof(gTickerSession)];
+    querySession(req, sid, sizeof(sid));
+    switchSessionIfNeeded(sid);
+
+    gClaudeState = st;
+    // 状态只影响颜色不改文字，但同样得触发重画，否则颜色会停在旧值
+    if (gTickerActive) gTickerDirty = true;
+    xSemaphoreGive(gTickerLock);
+  }
+
   httpd_resp_sendstr(req, "ok");
   return ESP_OK;
 }
