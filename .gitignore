@@ -2,6 +2,10 @@
 .vscode/
 include/secrets.h
 
+# 本地 hook 配置（把 Claude 输出推给时钟）。含本机设备地址，不随仓库分发；
+# 想启用的照 README 里的片段自己建一份。
+.claude/settings.local.json
+
 # 第三方库不进仓库（合计 158MB）。克隆后需按 platformio.ini 顶部的说明
 # 自行下载到 lib/，否则编译不过。
 lib/

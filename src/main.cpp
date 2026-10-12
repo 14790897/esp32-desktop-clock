@@ -2,6 +2,7 @@
 
 #include "driver/gpio.h"
 #include "esp_event.h"
+#include "esp_http_server.h"
 #include "esp_littlefs.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -86,13 +87,54 @@ constexpr uint16_t COL_WAIT = 0xFD20;
 
 // ==================== 版面 ====================
 constexpr int Y_STATUS = 10;
-constexpr int H_STATUS = 20;
+constexpr int H_STATUS = 26;
 constexpr int Y_TIME = 44;
 constexpr int H_TIME = 84;
 constexpr int Y_SECOND = 138;
 constexpr int H_SECOND = 30;
 constexpr int Y_DATE = 184;
 constexpr int H_DATE = 26;
+
+// ==================== Claude 输出字幕 ====================
+// 顶部那行原来是网络状态提示，收到 Claude 输出后改作字幕；没有文字时仍回退
+// 显示网络状态，所以启动阶段看到的还是原来的提示。
+//
+// 显示方式是「尾巴对齐」：最新文字永远贴在屏幕右边缘，旧文字被顶出左侧。
+// 不做匀速跑马灯 —— Claude 生成速度是每秒几十字，而可读的滚动速度只有约 6 字/秒，
+// 匀速滚必然越积越滞后，就不是实时了。
+
+constexpr int kTickerCap = 1024;        // 文字缓冲上限（字节），满了从前面丢
+constexpr int kTickerIndent = 4;        // 右侧留白
+constexpr uint16_t COL_BUSY = 0xFD20;   // 工作中：琥珀
+constexpr uint16_t COL_DONE = 0x07E0;   // 已完成：绿
+constexpr uint16_t COL_FAIL = 0xF800;   // 出错中断：红
+constexpr uint16_t COL_IDLE = 0x8410;   // 还没有过输出：灰
+
+// 字幕颜色直接反映 Claude 的状态，扫一眼就知道它是在干活还是干完了
+enum class ClaudeState : uint8_t { Idle, Working, Done, Failed };
+
+volatile ClaudeState gClaudeState = ClaudeState::Idle;
+
+uint16_t claudeColor() {
+  switch (gClaudeState) {
+    case ClaudeState::Working: return COL_BUSY;
+    case ClaudeState::Done: return COL_DONE;
+    case ClaudeState::Failed: return COL_FAIL;
+    default: return COL_IDLE;
+  }
+}
+
+char gTickerText[kTickerCap] = {};   // 显示缓冲。HTTP 线程持锁写，clockTask 只读
+volatile bool gTickerDirty = false;  // 有新内容，等 clockTask 重算宽度并重画
+volatile bool gTickerActive = false;
+int gTickerTextW = 0;  // 文本总宽，内容变化时重算一次
+SemaphoreHandle_t gTickerLock = nullptr;
+
+// 行内绘制走精灵缓冲：直接往屏幕上「先清后画」会闪，而且 drawString 往屏幕
+// 写 200 个字形要几十毫秒，主循环压根跑不到目标帧率。先在 RAM 里合成再整行推出去，
+// 既没有中间空白态，帧率也稳得住。
+lgfx::LGFX_Sprite gTickerSprite(&lcd);
+bool gTickerSpriteReady = false;
 
 // 上一帧画过的内容，用于比对出变化的字位
 char gPrevTime[8] = {};
@@ -160,6 +202,9 @@ void drawSlotString(const lgfx::IFont* font, const char* text, const char* chars
 }
 
 void drawStatus(uint16_t color, const char* msg) {
+  // 有 Claude 文字时这行归字幕，网络状态让位
+  if (gTickerActive) return;
+
   lcd.fillRect(0, Y_STATUS, W, H_STATUS, COL_BG);
   if (msg) {
     lcd.setFont(&fonts::FreeSans9pt7b);
@@ -169,6 +214,21 @@ void drawStatus(uint16_t color, const char* msg) {
   } else {
     lcd.fillCircle(W / 2, Y_STATUS + H_STATUS / 2, 4, color);
   }
+}
+
+// 按当前内容绘制定长字幕。尾巴对齐 —— 右边缘位置固定，文字变长时旧内容自然被
+// 顶出屏幕左侧，新内容始终可见。
+void drawTicker() {
+  if (!gTickerSpriteReady) return;
+
+  gTickerSprite.fillRect(0, 0, W, H_STATUS, COL_BG);
+  if (gTickerActive) {
+    gTickerSprite.setFont(&fonts::efontCN_24);
+    gTickerSprite.setTextSize(1.0f);
+    gTickerSprite.setTextColor(claudeColor());
+    gTickerSprite.drawString(gTickerText, W - kTickerIndent - gTickerTextW, (H_STATUS - 24) / 2);
+  }
+  gTickerSprite.pushSprite(0, Y_STATUS);
 }
 
 void drawTime(int hour, int minute) {
@@ -251,6 +311,11 @@ void onWifiEvent(void*, esp_event_base_t base, int32_t id, void*) {
   }
 }
 
+// 固定 IP：Claude Code 的 hook 要按固定地址推送，而 DHCP 分配的地址重启后可能变，
+// 地址一变推送就发丢了。代价是设备只能用在 192.168.137.x 网段（Windows 移动热点的
+// ICS 网段）。要拿到别的网络用，把下面这行注释掉即可退回 DHCP。
+#define CLOCK_USE_STATIC_IP
+
 bool wifiStart() {
   if (nvs_flash_init() != ESP_OK) return false;
   ESP_ERROR_CHECK(esp_netif_init());
@@ -268,7 +333,173 @@ bool wifiStart() {
 
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &staCfg));
+
+#ifdef CLOCK_USE_STATIC_IP
+  {
+    esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_dhcpc_stop(sta);
+    esp_netif_ip_info_t info = {};
+    IP4_ADDR(&info.ip, 192, 168, 137, 50);
+    IP4_ADDR(&info.gw, 192, 168, 137, 1);
+    IP4_ADDR(&info.netmask, 255, 255, 255, 0);
+    esp_netif_set_ip_info(sta, &info);
+    ESP_LOGI(kTag, "使用固定 IP 192.168.137.50");
+  }
+#endif
+
   ESP_ERROR_CHECK(esp_wifi_start());
+  return true;
+}
+
+// ==================== HTTP 服务：接收 Claude 的输出 ====================
+// 只在局域网监听，三个端点：
+//   POST /say     body 是文本，整体替换（手动测试、一次性推送用）
+//   POST /append  body 是新增文本，追加到末尾（实时回显用）
+//   POST /state   body 为 "working" / "done" / "failed"，只决定字幕颜色
+// PC 端由 Claude Code 的 hook 调用，见 tools/claude-status-hook.py
+
+// 把请求 body 读进 buf，返回实际字节数。超出 cap-1 的部分读掉丢弃 ——
+// 不排空会破坏 HTTP 连接状态，让同一连接上的后续请求失败。
+int readBody(httpd_req_t* req, char* buf, int cap) {
+  int total = 0;
+  int remaining = req->content_len;
+
+  while (remaining > 0) {
+    const int room = cap - 1 - total;
+    if (room <= 0) {
+      char sink[128];
+      const int want = remaining < static_cast<int>(sizeof(sink)) ? remaining
+                                                                 : static_cast<int>(sizeof(sink));
+      const int n = httpd_req_recv(req, sink, want);
+      if (n <= 0) {
+        if (n != HTTPD_SOCK_ERR_TIMEOUT) break;
+        continue;
+      }
+      remaining -= n;
+      continue;
+    }
+
+    const int want = remaining < room ? remaining : room;
+    const int n = httpd_req_recv(req, buf + total, want);
+    if (n <= 0) {
+      if (n != HTTPD_SOCK_ERR_TIMEOUT) break;  // 收完或出错
+      continue;                                 // 超时则继续等
+    }
+    total += n;
+    remaining -= n;
+  }
+  buf[total] = '\0';
+
+  // 截断可能正好切在汉字中间，退回到最后一个完整字符，否则屏幕上会多出乱码
+  int cut = total;
+  while (cut > 0 && (static_cast<unsigned char>(buf[cut - 1]) & 0xC0) == 0x80) --cut;
+  if (cut > 0) {
+    const unsigned char lead = static_cast<unsigned char>(buf[cut - 1]);
+    int need = 0;
+    if ((lead & 0x80) == 0x00) need = 1;
+    else if ((lead & 0xE0) == 0xC0) need = 2;
+    else if ((lead & 0xF0) == 0xE0) need = 3;
+    else if ((lead & 0xF8) == 0xF0) need = 4;
+    if (need == 0 || total - (cut - 1) < need) total = cut - 1;
+  }
+  return total;
+}
+
+void replaceTickerText(const char* s, int len) {
+  if (len <= 0 || xSemaphoreTake(gTickerLock, pdMS_TO_TICKS(50)) != pdTRUE) return;
+  if (len > kTickerCap - 1) len = kTickerCap - 1;
+  memcpy(gTickerText, s, len);
+  gTickerText[len] = '\0';
+  gTickerDirty = true;  // 先写内容再置脏，clockTask 看到脏标志时数据必然已完整
+  xSemaphoreGive(gTickerLock);
+}
+
+// 追加到末尾。满了从前面丢，保证新内容一定进得来 —— 尾巴对齐的显示方式下，
+// 被丢掉的老内容本来就已经滚出屏幕左侧了。
+void appendTickerText(const char* s, int len) {
+  if (len <= 0 || xSemaphoreTake(gTickerLock, pdMS_TO_TICKS(50)) != pdTRUE) return;
+
+  int cur = static_cast<int>(strlen(gTickerText));
+  if (cur + len > kTickerCap - 1) {
+    int drop = cur + len - (kTickerCap - 1);
+    // 对齐到 UTF-8 字符边界，别把汉字劈成半个
+    while (drop < cur && (static_cast<unsigned char>(gTickerText[drop]) & 0xC0) == 0x80) ++drop;
+    memmove(gTickerText, gTickerText + drop, cur - drop);
+    cur -= drop;
+  }
+  memcpy(gTickerText + cur, s, len);
+  gTickerText[cur + len] = '\0';
+  gTickerDirty = true;
+  xSemaphoreGive(gTickerLock);
+}
+
+esp_err_t handleSay(httpd_req_t* req) {
+  char buf[kTickerCap];
+  replaceTickerText(buf, readBody(req, buf, sizeof(buf)));
+  httpd_resp_sendstr(req, "ok");
+  return ESP_OK;
+}
+
+esp_err_t handleAppend(httpd_req_t* req) {
+  char buf[kTickerCap];
+  appendTickerText(buf, readBody(req, buf, sizeof(buf)));
+  httpd_resp_sendstr(req, "ok");
+  return ESP_OK;
+}
+
+esp_err_t handleState(httpd_req_t* req) {
+  char buf[16] = {};
+  const int n = httpd_req_recv(req, buf, sizeof(buf) - 1);
+  if (n > 0) {
+    buf[n] = '\0';
+    if (strncmp(buf, "working", 7) == 0) {
+      gClaudeState = ClaudeState::Working;
+    } else if (strncmp(buf, "failed", 6) == 0) {
+      gClaudeState = ClaudeState::Failed;
+    } else {
+      gClaudeState = ClaudeState::Done;  // "done" 及任何其它值都视为已完成
+    }
+  }
+  httpd_resp_sendstr(req, "ok");
+  return ESP_OK;
+}
+
+bool startHttpServer() {
+  gTickerLock = xSemaphoreCreateMutex();
+  if (gTickerLock == nullptr) {
+    ESP_LOGE(kTag, "创建字幕锁失败");
+    return false;
+  }
+
+  httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+  cfg.max_uri_handlers = 4;
+  cfg.lru_purge_enable = true;  // 连接堆积时回收最久未用的，避免句柄耗尽
+
+  httpd_handle_t server = nullptr;
+  if (httpd_start(&server, &cfg) != ESP_OK) {
+    ESP_LOGE(kTag, "HTTP 服务启动失败");
+    return false;
+  }
+
+  httpd_uri_t sayUri = {};
+  sayUri.uri = "/say";
+  sayUri.method = HTTP_POST;
+  sayUri.handler = handleSay;
+  httpd_register_uri_handler(server, &sayUri);
+
+  httpd_uri_t appendUri = {};
+  appendUri.uri = "/append";
+  appendUri.method = HTTP_POST;
+  appendUri.handler = handleAppend;
+  httpd_register_uri_handler(server, &appendUri);
+
+  httpd_uri_t stateUri = {};
+  stateUri.uri = "/state";
+  stateUri.method = HTTP_POST;
+  stateUri.handler = handleState;
+  httpd_register_uri_handler(server, &stateUri);
+
+  ESP_LOGI(kTag, "HTTP 服务已启动，等待 Claude 输出");
   return true;
 }
 
@@ -313,6 +544,7 @@ void serviceNetwork() {
       esp_netif_ip_info_t ip = {};
       esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip);
       ESP_LOGI(kTag, "wifi up, ip=" IPSTR, IP2STR(&ip.ip));
+      startHttpServer();
       startSntp();
       return;
     }
@@ -429,12 +661,33 @@ const char* matchReminder(const struct tm& t) {
   return nullptr;
 }
 
-void redrawStatusIndicator() {
-  if (netState == Net::Ready) {
+// 顶部那行的统一重画入口。有 Claude 文字时画字幕并复位滚动位置（从右边重新进入），
+// 否则回退到网络状态提示。GIF 播完、提醒结束后都要走这里。
+void redrawTopRow() {
+  if (gTickerActive) {
+    // 尾巴对齐，位置由内容宽度决定，GIF/提醒占屏后不需要复位什么，直接重画
+    drawTicker();
+  } else if (netState == Net::Ready) {
     drawStatus(COL_OK, nullptr);
   } else {
     drawStatus(COL_WAIT, "connecting wifi...");
   }
+}
+
+// 内容有更新时重算宽度并重画。只在 clockTask 里调用。
+// 宽度算法放在锁内，和 HTTP 线程的追加互斥；drawTicker 在锁外，避免持锁做绘制。
+void refreshTicker() {
+  if (!gTickerDirty || gTickerLock == nullptr) return;
+
+  xSemaphoreTake(gTickerLock, portMAX_DELAY);
+  lcd.setFont(&fonts::efontCN_24);
+  lcd.setTextSize(1.0f);
+  gTickerTextW = lcd.textWidth(gTickerText);
+  gTickerDirty = false;
+  xSemaphoreGive(gTickerLock);
+
+  gTickerActive = true;
+  drawTicker();
 }
 
 // ==================== 主循环 ====================
@@ -449,6 +702,7 @@ void clockTask(void*) {
 
   for (;;) {
     serviceNetwork();
+    refreshTicker();
 
     // 只要对过时就走内部 RTC，断网也继续显示
     if (!timeIsValid()) {
@@ -469,7 +723,7 @@ void clockTask(void*) {
         lcd.fillScreen(COL_BG);
         lastHour = lastMinute = lastSecond = lastDay = -1;  // 强制整屏重画时钟
         invalidateClockText();
-        redrawStatusIndicator();
+        redrawTopRow();
       }
     }
 
@@ -479,7 +733,7 @@ void clockTask(void*) {
         lcd.fillScreen(COL_BG);
         lastHour = lastMinute = lastSecond = lastDay = -1;  // 强制整屏重画
         invalidateClockText();
-        redrawStatusIndicator();
+        redrawTopRow();
       }
       vTaskDelay(pdMS_TO_TICKS(200));
       continue;
@@ -513,6 +767,8 @@ void clockTask(void*) {
       lastDay = t.tm_mday;
     }
 
+    // 字幕内容由 HTTP 线程置的脏标志驱动刷新（见 refreshTicker），
+    // 尾巴对齐不需要逐帧推进，所以这里保持省电节奏
     vTaskDelay(pdMS_TO_TICKS(200));
   }
 }
@@ -528,6 +784,18 @@ extern "C" void app_main(void) {
   lcd.init();
   lcd.setRotation(SCREEN_ROTATION);
   ESP_LOGI(kTag, "lcd ready, %dx%d", lcd.width(), lcd.height());
+
+  // 字幕行缓冲，在起 WiFi 之前建，堆还干净。建不起来只是没有字幕，别的功能不受影响。
+  //
+  // setSwapBytes(true)：精灵默认字节序和屏幕一致（都是 false），但实测通过
+  // pushSprite 推出去颜色会高低字节颠倒 —— 琥珀色会显示成蓝色。精灵和屏幕各自
+  // 的写转换在这里对不上，翻转精灵一侧即可。若哪天颜色又不对，先怀疑这一行。
+  gTickerSprite.setColorDepth(16);
+  gTickerSprite.setSwapBytes(true);
+  gTickerSpriteReady = (gTickerSprite.createSprite(W, H_STATUS) != nullptr);
+  if (!gTickerSpriteReady) {
+    ESP_LOGE(kTag, "字幕行缓冲创建失败，滚动字幕不可用");
+  }
 
   // 先挂载文件系统再起 WiFi：littlefs 挂载要分配缓存，而 WiFi 栈启动后会
   // 吃掉大量堆内存，放在后面挂载会因分配失败而挂不上
