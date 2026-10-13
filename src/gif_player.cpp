@@ -172,6 +172,8 @@ bool gifInitFramebuffer() {
   return true;
 }
 
+bool gifFramebufferMissing() { return gFb[0] == nullptr; }
+
 void gifFreeFramebuffer() {
   if (gFb[0] == nullptr) return;
   for (int half = 0; half < kFbHalves; ++half) {

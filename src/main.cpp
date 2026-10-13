@@ -874,6 +874,15 @@ void serviceNetwork() {
     // 这一轮起不来下一轮还会再试
     if (!httpStarted) httpStarted = startHttpServer();
     if (!sntpStarted) startSntp();  // 掉线重连时不要重复初始化 SNTP
+
+    // 配网模式里为了给 lwIP 让内存，帧缓冲被释放了；这儿连上网了要补回来，
+    // 否则 GIF 会一直走逐段推送那条慢路，直到下次重启为止。
+    // 拿不到就算了（配网刚结束、堆还紧），gifPlay 里面还会再试一次。
+    if (gifFramebufferMissing()) {
+      if (gifInitFramebuffer()) {
+        ESP_LOGI(kTag, "联网后已把 GIF 帧缓冲补回来，播放走整屏 DMA");
+      }
+    }
     netState = Net::Syncing;
     return;
   }

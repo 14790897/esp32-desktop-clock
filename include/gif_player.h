@@ -13,6 +13,10 @@ bool gifInitFramebuffer();
 // gifPlay 内部会自己重新分配，所以调用方不用管配对。
 void gifFreeFramebuffer();
 
+// 帧缓冲当前是不是空的（被 gifFreeFramebuffer 释放过、还没补回来）。
+// 联网后据此决定要不要补 —— 不补的话 GIF 会一直走逐段推送那条慢路。
+bool gifFramebufferMissing();
+
 // 播放 GIF 一遍。画布比屏幕宽时居中裁切；透明像素跳过以保留上一帧内容。
 // 文件打不开或解码失败返回 false。
 bool gifPlay(lgfx::LGFX_Device& lcd, const char* path);
