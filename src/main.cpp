@@ -131,6 +131,16 @@ char gTickerSession[48] = {};        // 当前内容属于哪个会话，换了�
 volatile bool gTickerDirty = false;  // 有新内容，等 clockTask 重算宽度并重画
 volatile bool gTickerActive = false;
 int gTickerTextW = 0;  // 文本总宽，内容变化时重算一次
+
+// 单行提示的轮播状态。放在这里而不是 showHint 旁边 —— /debug/ticker 要读它们，
+// 那个 handler 定义得更靠前。
+constexpr int kHintMaxFrames = 4;
+char gHintFrames[kHintMaxFrames][96] = {};
+uint16_t gHintMs[kHintMaxFrames] = {};
+int16_t gHintWidths[kHintMaxFrames] = {};  // 量好的像素宽，量的时候顺手存下来
+int gHintCount = 0;
+int gHintIndex = 0;
+uint32_t gHintAt = 0;
 SemaphoreHandle_t gTickerLock = nullptr;
 
 // 行内绘制走精灵缓冲：直接往屏幕上「先清后画」会闪，而且 drawString 往屏幕
@@ -518,6 +528,103 @@ esp_err_t handleState(httpd_req_t* req) {
   return ESP_OK;
 }
 
+// 转义成 JSON 字符串内容。字幕里可能出现引号、反斜杠、控制字符
+void jsonEscape(const char* s, char* out, size_t outLen) {
+  size_t o = 0;
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(s); *p != '\0'; ++p) {
+    char tmp[8];
+    const char* piece = tmp;
+    switch (*p) {
+      case '"': piece = "\\\""; break;
+      case '\\': piece = "\\\\"; break;
+      case '\n': piece = "\\n"; break;
+      case '\r': piece = "\\r"; break;
+      case '\t': piece = "\\t"; break;
+      default:
+        if (*p < 0x20) {
+          snprintf(tmp, sizeof(tmp), "\\u%04x", *p);
+        } else {
+          tmp[0] = static_cast<char>(*p);
+          tmp[1] = '\0';
+        }
+    }
+    const size_t n = strlen(piece);
+    if (o + n >= outLen) break;
+    memcpy(out + o, piece, n);
+    o += n;
+  }
+  out[o] = '\0';
+}
+
+const char* claudeStateName(ClaudeState s) {
+  switch (s) {
+    case ClaudeState::Working: return "working";
+    case ClaudeState::Done: return "done";
+    case ClaudeState::Failed: return "failed";
+    default: return "idle";
+  }
+}
+
+// 把字幕的当前状态以 JSON 吐出来，给 tests/ 里的 E2E 用例断言用。
+// 没有这个端点，HTTP 测试就只能断言「返回 200」—— 而「提示被裁成裸 IP」
+// 「颜色状态不对」「多会话串台」这些真踩过的坑一个都测不到。
+esp_err_t handleDebugTicker(httpd_req_t* req) {
+  // 快照必须在锁内取，否则可能读到写到一半的缓冲
+  char text[kTickerCap];
+  char session[sizeof(gTickerSession)];
+  int width = 0;
+  ClaudeState state = ClaudeState::Idle;
+  bool active = false;
+
+  if (xSemaphoreTake(gTickerLock, pdMS_TO_TICKS(100)) != pdTRUE) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "lock busy");
+    return ESP_FAIL;
+  }
+  snprintf(text, sizeof(text), "%s", gTickerText);
+  snprintf(session, sizeof(session), "%s", gTickerSession);
+  width = gTickerTextW;
+  state = gClaudeState;
+  active = gTickerActive;
+  xSemaphoreGive(gTickerLock);
+
+  // 转义后最大是原文两倍，全放栈上会顶爆 HTTP 任务的 4KB 栈，所以走堆
+  const size_t cap = strlen(text) * 2 + strlen(session) * 2 +
+                     static_cast<size_t>(kHintMaxFrames) * sizeof(gHintFrames[0]) * 2 + 512;
+  char* escText = static_cast<char*>(malloc(cap));
+  char* escSess = static_cast<char*>(malloc(sizeof(session) * 2));
+  char* escHint = static_cast<char*>(malloc(static_cast<size_t>(kHintMaxFrames) *
+                                            sizeof(gHintFrames[0]) * 2));
+  char* body = static_cast<char*>(malloc(cap + 256));
+  if (escText == nullptr || escSess == nullptr || escHint == nullptr || body == nullptr) {
+    free(escText); free(escSess); free(escHint); free(body);
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+    return ESP_FAIL;
+  }
+
+  jsonEscape(text, escText, cap);
+  jsonEscape(session, escSess, sizeof(session) * 2);
+
+  size_t o = 0;
+  o += snprintf(body + o, cap + 256 - o,
+                "{\"text\":\"%s\",\"state\":\"%s\",\"session\":\"%s\",\"active\":%s,"
+                "\"width\":%d,\"limit\":%d,\"hints\":[",
+                escText, claudeStateName(state), escSess, active ? "true" : "false", width,
+                W - kTickerIndent);
+
+  for (int i = 0; i < gHintCount && i < kHintMaxFrames; ++i) {
+    jsonEscape(gHintFrames[i], escHint, static_cast<size_t>(sizeof(gHintFrames[0])) * 2);
+    o += snprintf(body + o, cap + 256 - o, "%s{\"text\":\"%s\",\"width\":%d}",
+                  i == 0 ? "" : ",", escHint, gHintWidths[i]);
+  }
+  snprintf(body + o, cap + 256 - o, "]}");
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, body);
+
+  free(escText); free(escSess); free(escHint); free(body);
+  return ESP_OK;
+}
+
 bool startHttpServer() {
   if (gTickerLock == nullptr) {
     ESP_LOGE(kTag, "字幕锁未初始化");
@@ -525,7 +632,7 @@ bool startHttpServer() {
   }
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-  cfg.max_uri_handlers = 4;
+  cfg.max_uri_handlers = 5;
   cfg.lru_purge_enable = true;  // 连接堆积时回收最久未用的，避免句柄耗尽
 
   httpd_handle_t server = nullptr;
@@ -552,6 +659,13 @@ bool startHttpServer() {
   stateUri.method = HTTP_POST;
   stateUri.handler = handleState;
   httpd_register_uri_handler(server, &stateUri);
+
+  // 只读的诊断端点，给 tests/ 用。不参与正常业务，也不改任何状态。
+  httpd_uri_t debugUri = {};
+  debugUri.uri = "/debug/ticker";
+  debugUri.method = HTTP_GET;
+  debugUri.handler = handleDebugTicker;
+  httpd_register_uri_handler(server, &debugUri);
 
   ESP_LOGI(kTag, "HTTP 服务已启动，等待 Claude 输出");
   return true;
@@ -604,12 +718,6 @@ void startSntp() {
 // 更宽 —— 两种情况下屏幕上都只剩个裸 IP 或网址，最该看的那半句反而没了。
 // 整个屏幕又只有这一条消息行（下面几行是时钟和日期），所以统一拆成
 // 「标签 / 取值」交替的短帧轮播：每帧都短到放得下，连起来读正好是一句完整提示。
-constexpr int kHintMaxFrames = 4;
-char gHintFrames[kHintMaxFrames][96] = {};
-uint16_t gHintMs[kHintMaxFrames] = {};
-int gHintCount = 0;
-int gHintIndex = 0;
-uint32_t gHintAt = 0;
 
 void showHint(const char* const* texts, const uint16_t* durations, int count) {
   if (count > kHintMaxFrames) count = kHintMaxFrames;
@@ -626,6 +734,7 @@ void showHint(const char* const* texts, const uint16_t* durations, int count) {
   lcd.setTextSize(1.0f);
   for (int i = 0; i < count; ++i) {
     const int w = lcd.textWidth(gHintFrames[i]);
+    gHintWidths[i] = static_cast<int16_t>(w);  // 存下来，HTTP 线程读它就不用碰 lcd
     if (w > W - kTickerIndent) {
       ESP_LOGW(kTag, "提示第 %d 帧「%s」宽 %dpx，超出可显示的 %dpx，会被裁掉", i,
                gHintFrames[i], w, W - kTickerIndent);
