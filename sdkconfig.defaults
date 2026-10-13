@@ -1,0 +1,21 @@
+# 给 ESP-IDF/PlatformIO 生成 sdkconfig 用的默认值。改这里才会进版本库，
+# sdkconfig.esp32c3-clock 是生成物、已被 .gitignore 排除。
+
+# 关掉 DHCP 服务器的「静态 ARP 记录」模式。
+#
+# 打开时（IDF 默认）DHCP 服务器会给客户端单播发 OFFER/ACK，为此要临时往
+# ARP 表塞一条静态记录。实测这条链会失败：
+#
+#   手机不置广播位 → 服务器决定单播 → etharp_add_static_entry() 加记录
+#   （返回值被丢弃）→ ARP 表满时加不进去 → udp_sendto 找不到 ARP 记录
+#   直接返回 -1 (ERR_MEM) → ACK 发不出去 → 手机永远卡在「获取 IP 地址」
+#
+# 实测日志（把 IDF 里 DHCPS_DEBUG 打开后）：
+#   dhcps: send_offer>>udp_sendto result 0        ← OFFER 成功
+#   dhcps: send_ack>>udp_sendto result ffffffff   ← ACK 失败，重试两次才成
+#
+# 而 ARP 记录会泄漏：客户端开始正常通信后该条目会变成动态条目，
+# etharp_remove_static_entry() 便删不掉它（返回 ERR_ARG），反复配网就把表撑满。
+#
+# 关掉之后 DHCP 服务器一律广播 OFFER/ACK，不依赖 ARP，绕开整条失败链。
+CONFIG_LWIP_DHCPS_STATIC_ENTRIES=n

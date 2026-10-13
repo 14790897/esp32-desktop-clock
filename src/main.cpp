@@ -349,6 +349,10 @@ void initWifi() {
   // 所以这个判断必须由应用自己做，组件 README 里也是这么示范的。
   if (SsidManager::GetInstance().GetSsidList().empty()) {
     ESP_LOGI(kTag, "没有已保存的 WiFi，进入配网模式");
+    // 115KB 的 GIF 帧缓冲先还给堆：配网时用不到它，而堆被占着时 lwIP
+    // 发 DHCP ACK 会分配不到内存（udp_sendto 返回 -1），客户端就卡在
+    // 「获取 IP 地址」。按 BOOT 键播放时会自动重新分配。
+    gifFreeFramebuffer();
     wifi.StartConfigAp();
   } else {
     wifi.StartStation();
@@ -702,6 +706,7 @@ void serviceNetwork() {
       ESP_LOGW(kTag, "连接超时，改入配网模式");
       tryingSince = 0;
       stopHttpServer();
+      gifFreeFramebuffer();  // 同上：配网要那 115KB 才发得出 DHCP ACK
       wifi.StartConfigAp();
     }
     return;
@@ -943,6 +948,13 @@ void clockTask(void*) {
 }  // namespace
 
 extern "C" void app_main(void) {
+  // 临时诊断：手机能关联却卡在「获取 IP 地址」。
+  // 注意 ESP-IDF 的 DHCP 服务器**不用 ESP_LOG** —— 它的 60 条日志全包在
+  // `#if DHCPS_DEBUG` 里，而该宏默认为 0，release 构建下一条都不存在，
+  // 所以在这里设 esp_log_level_set("dhcps", ...) 是没用的（试过，白搭）。
+  // 真正的开关在 components/lwip/apps/dhcpserver/dhcpserver.c 里的
+  // DHCPS_DEBUG，已临时改成 1，改完要一起还原。
+
   // 不主动驱动 TFT_BL：gallery-pro 全程未使用该引脚，屏幕仍正常点亮，
   // 说明背光由硬件自行处理（接 VCC 或默认导通），软件干预反而可能关掉它
   ESP_LOGI(kTag, "TFT_BL=gpio%d 交由硬件处理，软件不驱动", TFT_BL);

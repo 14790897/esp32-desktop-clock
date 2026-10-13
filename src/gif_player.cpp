@@ -172,8 +172,25 @@ bool gifInitFramebuffer() {
   return true;
 }
 
+void gifFreeFramebuffer() {
+  if (gFb[0] == nullptr) return;
+  for (int half = 0; half < kFbHalves; ++half) {
+    free(gFb[half]);
+    gFb[half] = nullptr;
+  }
+  gFbIsDma = false;
+  ESP_LOGI(kTag, "帧缓冲已释放，最大连续块 %u 字节",
+           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+}
+
 bool gifPlay(lgfx::LGFX_Device& lcd, const char* path) {
   gLcd = &lcd;
+
+  // 配网模式下会主动释放帧缓冲（见 gifFreeFramebuffer 的说明），这里补回来。
+  // WiFi 起来之后 DMA 内存可能已经不够，那就退回逐段推送，只是慢一些。
+  if (gFb[0] == nullptr && !gifInitFramebuffer()) {
+    ESP_LOGW(kTag, "重新分配帧缓冲失败，本次退回逐段推送（会明显变慢）");
+  }
 
   if (!gGif.open(path, fileOpen, fileClose, fileRead, fileSeek, drawLine)) {
     ESP_LOGE(kTag, "打不开或不是合法的 GIF: %s (err=%d)", path, gGif.getLastError());

@@ -7,6 +7,12 @@
 // 分配失败会返回 false，此时 gifPlay 退回较慢的逐段推送，仍可播放。
 bool gifInitFramebuffer();
 
+// 释放帧缓冲，把 115KB 还给堆。配网模式下必须还 —— 实测堆本来就只剩
+// 100KB 出头，被它占着时 lwIP 发 DHCP ACK 会因分配不到内存而失败
+// （udp_sendto 返回 -1 ERR_MEM），客户端就卡在「获取 IP 地址」。
+// gifPlay 内部会自己重新分配，所以调用方不用管配对。
+void gifFreeFramebuffer();
+
 // 播放 GIF 一遍。画布比屏幕宽时居中裁切；透明像素跳过以保留上一帧内容。
 // 文件打不开或解码失败返回 false。
 bool gifPlay(lgfx::LGFX_Device& lcd, const char* path);

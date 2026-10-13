@@ -195,7 +195,8 @@ curl -X POST -d working   http://192.168.1.77/state     # 状态：working/done/
 
 - **提醒文字只能用 efontCN_24 覆盖到的汉字**，且字形固定、不可缩放。用了字库外的生僻字会显示空白。
 - **中文点阵字库占 554KB flash**，所以分区表用了自定义的 `partitions.csv`（app 区 2MB），默认分区表 1MB 装不下。
-- **GIF 播放需要 115KB 帧缓冲**，且必须 DMA 可访问 —— 实测堆里凑不出连续的 115200 字节，所以拆成了上下两块各 57600 字节。
+- **GIF 播放需要 115KB 帧缓冲**，且必须 DMA 可访问 —— 实测堆里凑不出连续的 115200 字节，所以拆成了上下两块各 57600 字节。**配网模式下会主动把它还给堆**，见下条。
+- **配网时 lwIP 发不出 DHCP 应答（会让客户端卡在「获取 IP 地址」）**，根因是内存不够：开机可用堆只有 107KB 左右，而 115KB 的 GIF 帧缓冲一开机就常驻、配网时毫无用处，lwIP 发 ACK 时分配不到内存就返回 `-1 (ERR_MEM)`，客户端永远等不到应答。修法是进配网前先 `gifFreeFramebuffer()`，按 BOOT 键播放时再自动分配。另外 `sdkconfig.defaults` 里关掉了 `CONFIG_LWIP_DHCPS_STATIC_ENTRIES`（让 DHCP 服务器一律广播，不依赖 ARP 表）。诊断这段需要把 IDF 源码 `components/lwip/apps/dhcpserver/dhcpserver.c` 里的 `DHCPS_DEBUG` 改成 1 重编 —— 注意它**不用 `ESP_LOG`**，默认构建下 60 条调试输出全是死的。
 - GIF 画面与时钟不能同时显示，播放期间时钟暂停刷新。
 - **配网页面不支持设静态 IP**（esp-wifi-connect 的 Advanced 页只有 OTA 地址、发射功率、记住 BSSID 三项），所以设备走 DHCP。IP 变了要重新填 `CLAUDE_CLOCK_URL` —— 可以在路由器上按 `esp32-clock` 这个主机名绑一个固定地址。
 
