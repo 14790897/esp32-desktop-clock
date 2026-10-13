@@ -200,20 +200,35 @@ curl -X POST -d working   http://192.168.1.77/state     # 状态：working/done/
 
 ```bash
 pip install -r tests/requirements.txt
-set CLAUDE_CLOCK_URL=http://192.168.137.45
-pytest tests/ -v
+set CLAUDE_CLOCK_URL=http://192.168.137.12
+set ESSPORT=COM5
+pytest -v
 ```
 
-覆盖的是 HTTP 接口的**行为**而不只是状态码：`/say` 是替换、`/append` 是追加、
-`/append` 会把状态推成 working（状态由数据流推导，不依赖异步的开工信号）、
-状态值的映射、换会话清空字幕、宽度跟着内容更新、超长文字被截断且不切坏汉字。
+串口号也可以在 `pytest.ini` 里固定；不给的话 pytest-embedded 会自己探测。
 
-为此固件里加了一个只读诊断端点 **`GET /debug/ticker`**，返回当前字幕的
-文本/状态/会话/宽度/上限，以及轮播提示的每一帧和实测宽度。没有它，HTTP 测试
-只能断言「返回 200」，而「提示被裁成裸 IP」「多会话串台」这些真踩过的坑一个都拦不住。
+三层：
 
-> 注意 `width` 是**异步**算的（`clockTask` 里用 `lcd.textWidth()`，HTTP 线程不能碰
-> lcd），刚写完时读到的还是上一段的宽度，测试里用 `Clock.wait_for_width()` 等它跟上。
+| 文件 | 打什么 | 层 |
+|---|---|---|
+| `test_boot.py` | 复位真机，断言启动走到联网对时（官方 pytest-embedded 的 `dut` 夹具） | 串口 |
+| `test_http.py` | `/say` `/append` `/state` 的**行为**，不只是状态码 | HTTP |
+| `test_provision.py` | 配网全流程：擦凭据 → 进配网 → 客户端拿 DHCP → 提示不超宽 | 串口+HTTP |
+
+**`test_provision.py` 默认不跑**，它有副作用（擦设备凭据、切 PC 网卡），要显式开：
+
+```bash
+set CLOCK_E2E_PROVISION=1
+pytest tests/test_provision.py -v
+```
+
+它会先把 nvs 分区备份出来、测完写回，所以设备的 WiFi 凭据不会丢。前提是 **PC 的
+移动热点必须关着** —— 热点开着时无线网卡无法作为客户端连设备热点，测试会检查并跳过。
+
+> 串口断言只能用 **ASCII**：pexpect 的 encoding 默认是 None，中文模式会被按 ASCII
+> 编码直接抛 `UnicodeEncodeError`。好在每条关键日志都有 ASCII 部分（`lcd ready`、
+> `wifi up, ssid=`、`time synced:`）。固件里那条提示超宽的告警也因此带了
+> `hint-frame-clipped` 前缀，给测试做机器可读标记。
 
 **测不到的**：屏幕像素。渲染回归（「3 数字有丝线」那类）目前只能靠肉眼，
 要进一步得让 `drawTicker` 能把 sprite dump 成 PPM 通过 HTTP 取回。

@@ -729,15 +729,17 @@ void showHint(const char* const* texts, const uint16_t* durations, int count) {
   gHintIndex = 0;
   gHintAt = nowMs();
 
-  // 宽度是量出来的不是猜的：WIFI_AP_PREFIX 改长、或 IP 段变长都会静默裁字
+  // 宽度是量出来的不是猜的：WIFI_AP_PREFIX 改长、或 IP 段变长都会静默裁字。
+  // 前缀 `hint-frame-clipped` 是给测试用的机器可读标记（tests/test_provision.py），
+  // 串口断言只能用 ASCII，而后面这句是中文。
   lcd.setFont(&fonts::efontCN_24);
   lcd.setTextSize(1.0f);
   for (int i = 0; i < count; ++i) {
     const int w = lcd.textWidth(gHintFrames[i]);
     gHintWidths[i] = static_cast<int16_t>(w);  // 存下来，HTTP 线程读它就不用碰 lcd
     if (w > W - kTickerIndent) {
-      ESP_LOGW(kTag, "提示第 %d 帧「%s」宽 %dpx，超出可显示的 %dpx，会被裁掉", i,
-               gHintFrames[i], w, W - kTickerIndent);
+      ESP_LOGW(kTag, "hint-frame-clipped: 提示第 %d 帧「%s」宽 %dpx，超出可显示的 %dpx，会被裁掉",
+               i, gHintFrames[i], w, W - kTickerIndent);
     }
   }
 

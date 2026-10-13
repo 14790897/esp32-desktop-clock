@@ -1,2 +1,7 @@
+# HTTP 层（打真机，靠 CLAUDE_CLOCK_URL）
 pytest>=8.0
 requests>=2.31
+
+# 串口层（test_boot.py 用官方 pytest-embedded 的 dut 夹具）
+pytest-embedded>=2.9
+pytest-embedded-serial-esp>=2.9
