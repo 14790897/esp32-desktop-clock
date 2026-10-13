@@ -19,3 +19,11 @@
 #
 # 关掉之后 DHCP 服务器一律广播 OFFER/ACK，不依赖 ARP，绕开整条失败链。
 CONFIG_LWIP_DHCPS_STATIC_ENTRIES=n
+
+# 让 DHCP 客户端记住上次拿到的地址，重启/重连时主动要回同一个。
+#
+# 为什么不用静态 IP：写死地址会让设备换到别的网络就连不上，而「别人克隆下来
+# 开箱就能配网」是这个项目的核心目标（配网门户就是为它做的）。这个选项两头都占：
+# 地址空着就复用（CLAUDE_CLOCK_URL 因此稳定），被别人占了就自动退回正常 DHCP
+# （换网络照常能用）。上次的有效配置存在 nvs 里。
+CONFIG_LWIP_DHCP_RESTORE_LAST_IP=y
