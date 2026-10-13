@@ -112,7 +112,12 @@ static const Reminder kReminders[] = {
 
 > 配网页面本身也存在 LittleFS 里（`data/wifi_configuration*.html`），改完要跑 `pio run -t uploadfs` 才生效。
 
-> **想换到「本机自己开的热点」上时有个死循环**：要访问 `192.168.4.1` 得先关掉本机热点（否则无线网卡不能同时作客户端），可时钟又必须在提交那一刻热点已经开着。这时别走门户，直接写 NVS：造一份 `ssid`/`password` 的 CSV，用 IDF 的 `nvs_partition_gen.py` 生成镜像，刷到 `0x9000`（分区表里 nvs 区，大小 `0x6000`）。凭据格式见 `lib/esp-wifi-connect/ssid_manager.cc`（命名空间 `wifi`）。清凭据回配网模式：`esptool erase_region 0x9000 0x6000`。
+> **想换到「本机自己开的热点」上时可能撞上死循环**：要访问 `192.168.4.1` 得让无线去连设备热点，可时钟又必须在提交那一刻热点已经开着。成不成，取决于**热点把哪条线路共享出去**：
+>
+> - 热点共享的是**无线**（没插网线时的必然情况）→ Windows 把 STA 钉在上游那条链路上，无线连不了别的 AP → **死循环**
+> - 热点共享的是**有线**（或任何非无线）→ 无线完全自由，能同时连设备热点 → 走门户就行
+>
+> 判断方法：热点设置里看「共享网络连接」指向谁。真撞上死循环时别走门户，直接写 NVS：造一份 `ssid`/`password` 的 CSV，用 IDF 的 `nvs_partition_gen.py` 生成镜像，刷到 `0x9000`（分区表里 nvs 区，大小 `0x6000`）。凭据格式见 `lib/esp-wifi-connect/ssid_manager.cc`（命名空间 `wifi`）。清凭据回配网模式：`esptool erase_region 0x9000 0x6000`。
 
 ## 换 GIF
 
@@ -223,7 +228,8 @@ pytest tests/test_provision.py -v
 ```
 
 它会先把 nvs 分区备份出来、测完写回，所以设备的 WiFi 凭据不会丢。前提是 **PC 的
-移动热点必须关着** —— 热点开着时无线网卡无法作为客户端连设备热点，测试会检查并跳过。
+移动热点必须关着** —— 保守起见：热点共享无线时无线网卡切不了别的 AP，而测试没法
+可靠判断热点共享的是哪条线路。热点开着时会检查并跳过。
 
 > 串口断言只能用 **ASCII**：pexpect 的 encoding 默认是 None，中文模式会被按 ASCII
 > 编码直接抛 `UnicodeEncodeError`。好在每条关键日志都有 ASCII 部分（`lcd ready`、
@@ -240,7 +246,7 @@ pytest tests/test_provision.py -v
 - **GIF 播放需要 115KB 帧缓冲**，且必须 DMA 可访问 —— 实测堆里凑不出连续的 115200 字节，所以拆成了上下两块各 57600 字节。**配网模式下会主动把它还给堆**，见下条。
 - **配网时 lwIP 发不出 DHCP 应答（会让客户端卡在「获取 IP 地址」）**，根因是内存不够：开机可用堆只有 107KB 左右，而 115KB 的 GIF 帧缓冲一开机就常驻、配网时毫无用处，lwIP 发 ACK 时分配不到内存就返回 `-1 (ERR_MEM)`，客户端永远等不到应答。修法是进配网前先 `gifFreeFramebuffer()`，按 BOOT 键播放时再自动分配。另外 `sdkconfig.defaults` 里关掉了 `CONFIG_LWIP_DHCPS_STATIC_ENTRIES`（让 DHCP 服务器一律广播，不依赖 ARP 表）。诊断这段需要把 IDF 源码 `components/lwip/apps/dhcpserver/dhcpserver.c` 里的 `DHCPS_DEBUG` 改成 1 重编 —— 注意它**不用 `ESP_LOG`**，默认构建下 60 条调试输出全是死的。
 - GIF 画面与时钟不能同时显示，播放期间时钟暂停刷新。
-- **配网页面不支持设静态 IP**（esp-wifi-connect 的 Advanced 页只有 OTA 地址、发射功率、记住 BSSID 三项），所以设备走 DHCP。不过 `sdkconfig.defaults` 里开了 `CONFIG_LWIP_DHCP_RESTORE_LAST_IP`：客户端会把上次拿到的地址存进 nvs，重连时**主动要回同一个**（实测重启两次地址不变），要不到才退回正常 DHCP。所以 `CLAUDE_CLOCK_URL` 在一次配网后是稳定的，且换网络照常能用 —— 比写死静态 IP 好，后者会让设备一到别的网络就联不上。
+- **配网页面不支持设静态 IP**（esp-wifi-connect 的 Advanced 页只有 OTA 地址、发射功率、记住 BSSID 三项），所以设备走 DHCP。`sdkconfig.defaults` 里开了 `CONFIG_LWIP_DHCP_RESTORE_LAST_IP`：客户端把上次的地址存进 nvs，重连时主动要回同一个，要不到才退回正常 DHCP。**实测设备重启地址不变，但重启热点/路由器仍可能换**（ICS 的租约表一重置就重新分配，实测 .12 → .66 → .174）—— 换网络也照常能用。没去写死静态 IP，那会让设备一到别的网络就联不上。
 
 ## 参考资料
 
