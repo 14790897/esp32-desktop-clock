@@ -2,6 +2,7 @@
 
 #include "driver/gpio.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_littlefs.h"
 #include "esp_log.h"
@@ -594,7 +595,7 @@ esp_err_t handleDebugTicker(httpd_req_t* req) {
   char* escSess = static_cast<char*>(malloc(sizeof(session) * 2));
   char* escHint = static_cast<char*>(malloc(static_cast<size_t>(kHintMaxFrames) *
                                             sizeof(gHintFrames[0]) * 2));
-  char* body = static_cast<char*>(malloc(cap + 256));
+  char* body = static_cast<char*>(malloc(cap + 384));
   if (escText == nullptr || escSess == nullptr || escHint == nullptr || body == nullptr) {
     free(escText); free(escSess); free(escHint); free(body);
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
@@ -605,18 +606,26 @@ esp_err_t handleDebugTicker(httpd_req_t* req) {
   jsonEscape(session, escSess, sizeof(session) * 2);
 
   size_t o = 0;
-  o += snprintf(body + o, cap + 256 - o,
+  o += snprintf(body + o, cap + 384 - o,
                 "{\"text\":\"%s\",\"state\":\"%s\",\"session\":\"%s\",\"active\":%s,"
-                "\"width\":%d,\"limit\":%d,\"hints\":[",
+                "\"width\":%d,\"limit\":%d,"
+                // 堆余量。加这两个字段是为了让测试能在**堆被吃光之前**报警 ——
+                // 配网时 lwIP 发不出去 DHCP ACK 那个 bug 的表现是客户端卡在
+                // 「获取 IP 地址」，而根因是内存。以后再往常驻内存里塞大块东西，
+                // 测试会先在堆余量上红，不用等到有人拿手机去连。
+                "\"free_heap\":%u,\"largest_block\":%u,\"largest_block_dma\":%u,"
+                "\"hints\":[",
                 escText, claudeStateName(state), escSess, active ? "true" : "false", width,
-                W - kTickerIndent);
+                W - kTickerIndent, static_cast<unsigned>(esp_get_free_heap_size()),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
 
   for (int i = 0; i < gHintCount && i < kHintMaxFrames; ++i) {
     jsonEscape(gHintFrames[i], escHint, static_cast<size_t>(sizeof(gHintFrames[0])) * 2);
-    o += snprintf(body + o, cap + 256 - o, "%s{\"text\":\"%s\",\"width\":%d}",
+    o += snprintf(body + o, cap + 384 - o, "%s{\"text\":\"%s\",\"width\":%d}",
                   i == 0 ? "" : ",", escHint, gHintWidths[i]);
   }
-  snprintf(body + o, cap + 256 - o, "]}");
+  snprintf(body + o, cap + 384 - o, "]}");
 
   httpd_resp_set_type(req, "application/json");
   httpd_resp_sendstr(req, body);

@@ -217,8 +217,22 @@ pytest -v
 | 文件 | 打什么 | 层 |
 |---|---|---|
 | `test_boot.py` | 复位真机，断言启动走到联网对时（官方 pytest-embedded 的 `dut` 夹具） | 串口 |
-| `test_http.py` | `/say` `/append` `/state` 的**行为**，不只是状态码 | HTTP |
-| `test_provision.py` | 配网全流程：擦凭据 → 进配网 → 客户端拿 DHCP → 提示不超宽 | 串口+HTTP |
+| `test_http.py` | `/say` `/append` `/state` 的**行为**，不只是状态码；外加堆余量下限 | HTTP |
+| `test_provision.py` | 配网全流程：擦凭据 → 进配网 → 客户端拿 DHCP → 堆余量 → 提示不超宽 | 串口+HTTP |
+
+**堆余量是被专门盯住的一项**，因为「设备发不出 DHCP 应答、客户端卡在获取 IP」那个 bug 的根因就是内存（见「已知限制」）。与其等有人拿手机去连、发现卡住，不如直接守数字：
+
+| 模式 | 最大连续块（实测基线） | 测试下限 |
+|---|---|---|
+| 配网（帧缓冲已释放） | **58.0 KB** | 40 KB |
+| 联网（帧缓冲按设计常驻） | **7.5 KB** | 4 KB |
+
+配网那条最关键 —— 它守的是设备给别人发 DHCP 的那条路径。`/debug/ticker` 里带了
+`free_heap` / `largest_block` / `largest_block_dma`，配网模式下 HTTP 服务还没起，
+所以固件另外在 `gifFreeFramebuffer()` 里打一行 `heap-after-free free=.. largest=.. dma_largest=..`
+供串口断言。
+
+**往后往常驻内存里塞大块东西，这两条会先红** —— 不用等到现象复现。
 
 **`test_provision.py` 默认不跑**，它有副作用（擦设备凭据、切 PC 网卡），要显式开：
 
@@ -227,9 +241,14 @@ set CLOCK_E2E_PROVISION=1
 pytest tests/test_provision.py -v
 ```
 
-它会先把 nvs 分区备份出来、测完写回，所以设备的 WiFi 凭据不会丢。前提是 **PC 的
-移动热点必须关着** —— 保守起见：热点共享无线时无线网卡切不了别的 AP，而测试没法
-可靠判断热点共享的是哪条线路。热点开着时会检查并跳过。
+它会先把 nvs 分区备份出来、测完写回，所以设备的 WiFi 凭据不会丢。
+
+测试要临时把 PC 的无线挂到设备配网热点上。**按结果区分两种情况**（`_connect_device_ap`）：
+
+- **关联不上** → 前置条件不满足（移动热点多半在共享无线，Windows 会把 STA 钉在上游链路上）→ **跳过**
+- **关联上了却拿不到 `192.168.4.x`** → 正是设备发不出 DHCP 应答的病征 → **失败**
+
+这个区分很重要：混在一起的话，真出现 DHCP bug 会被当成「环境问题」跳过去，等于把 bug 藏起来。
 
 > 串口断言只能用 **ASCII**：pexpect 的 encoding 默认是 None，中文模式会被按 ASCII
 > 编码直接抛 `UnicodeEncodeError`。好在每条关键日志都有 ASCII 部分（`lcd ready`、

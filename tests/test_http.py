@@ -99,6 +99,22 @@ def test_超长文字被截断且不切坏汉字(clock, sid):
     assert "�" not in snap["text"], "有汉字被切成了半个，屏幕会出乱码"
 
 
+def test_堆余量没有被饿死(clock):
+    """联网时的堆非常紧，这条只守一个「没被饿死」的下限。
+
+    实测基线：Free 16.3 KB、最大连续块 7.5 KB —— 因为 115KB 的 GIF 帧缓冲
+    在联网时是**按设计常驻**的（留给 BOOT 键播放）。真正需要充裕堆的是配网
+    模式，那条断言在 test_provision.py 里。
+
+    这里守 4 KB：往常驻内存里再加东西会把这条顶红，是个早期的提醒。
+    """
+    snap = clock.ticker()
+    assert snap["largest_block"] >= 4096, (
+        f"联网时最大连续块只剩 {snap['largest_block'] / 1024:.1f} KB"
+        f"（基线 7.5 KB）—— 堆被饿死了，再往下走 lwIP 就要分配失败了"
+    )
+
+
 def test_提示帧宽度不超出可显示范围(clock):
     """提示帧（配网提示、开机 IP）写成整句会被尾巴对齐裁掉开头。
 

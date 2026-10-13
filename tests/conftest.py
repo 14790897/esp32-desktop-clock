@@ -80,11 +80,18 @@ def clock() -> Clock:
         pytest.skip("未设置 CLAUDE_CLOCK_URL，跳过需要真机的 E2E 测试")
 
     c = Clock(url)
-    try:
-        c.ticker()
-    except requests.RequestException as exc:
-        pytest.skip(f"时钟不可达（{url}）：{exc}")
-    return c
+    # 要等而不是探一次就判死：test_boot 会复位设备，复位后重新关联 + 拿 DHCP +
+    # 对时要好几秒，期间 HTTP 是不通的。只给 5 秒会把「还没连上」误判成「设备不在」。
+    deadline = time.time() + 40
+    last = None
+    while time.time() < deadline:
+        try:
+            c.ticker()
+            return c
+        except requests.RequestException as exc:
+            last = exc
+            time.sleep(2)
+    pytest.skip(f"时钟不可达（{url}，等了 40 秒）：{last}")
 
 
 @pytest.fixture

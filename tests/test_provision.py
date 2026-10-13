@@ -17,6 +17,7 @@
 """
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -31,7 +32,6 @@ NVS_SIZE = 0x6000
 
 DEVICE_AP = "esp32-clock-5745"
 PORTAL = "http://192.168.4.1"
-PORTAL_TIMEOUT = 10
 
 # 切网卡 + DHCP + 提交 + 恢复，给足余量
 WIFI_SWITCH_TIMEOUT = 30
@@ -63,13 +63,6 @@ def _wifi_ip() -> str:
     import re
     m = re.search(r"IP Address:\s+(\S+)", _netsh("int", "ip", "show", "addresses", "name=WLAN"))
     return m.group(1) if m else ""
-
-
-def _hotspot_on() -> bool:
-    out = _run("powershell", "-NoProfile", "-Command",
-               "Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*Wi-Fi Direct*'} "
-               "| Select-Object -ExpandProperty Status").stdout
-    return "Up" in out
 
 
 def _reset_device() -> None:
@@ -114,6 +107,47 @@ def _wait_wifi(expected_ssid: str, want_ip_prefix: str = "", timeout: float = WI
     return ""
 
 
+def _connect_device_ap() -> tuple[bool, str]:
+    """把 PC 的无线挂到设备的配网热点上。返回 (是否关联上, 拿到的 IP)。
+
+    把「关联」和「拿到 DHCP 地址」分开是有意的 —— 两者失败含义完全不同：
+
+    - **关联不上** = 前置条件不满足（PC 的移动热点多半在共享无线，Windows 把
+      STA 钉在上游链路上，切不了别的 AP）。这时该跳过。
+    - **关联上了但拿不到 192.168.4.x** = 正是设备发不出 DHCP 应答的病征
+      （`udp_sendto` 返回 -1 ERR_MEM）。这时**必须失败**，跳过就把 bug 藏起来了。
+    """
+    _netsh("wlan", "connect", f"name={DEVICE_AP}")
+
+    deadline = time.time() + WIFI_SWITCH_TIMEOUT
+    while time.time() < deadline:
+        if _wifi_ssid() == DEVICE_AP:
+            break
+        time.sleep(1)
+    else:
+        return False, ""
+
+    deadline = time.time() + WIFI_SWITCH_TIMEOUT
+    while time.time() < deadline:
+        ip = _wifi_ip()
+        if ip.startswith("192.168.4."):
+            return True, ip
+        time.sleep(1)
+    return True, ""
+
+
+def _require_device_ap() -> str:
+    associated, ip = _connect_device_ap()
+    if not associated:
+        pytest.skip(f"PC 连不上设备热点 {DEVICE_AP} —— 多半是移动热点在共享无线，"
+                    "Windows 此时会把 STA 钉在上游链路上（热点改共享有线即可）")
+    assert ip, (
+        f"已关联 {DEVICE_AP} 但拿不到 192.168.4.x 的地址（当前 {_wifi_ip()!r}）—— "
+        "这正是 DHCP 应答发不出去时的病征，检查配网前有没有把 GIF 帧缓冲还给堆"
+    )
+    return ip
+
+
 @pytest.fixture
 def com_port() -> str:
     return os.environ.get("ESPPORT", "COM5")
@@ -151,8 +185,6 @@ def require_opt_in():
     if os.environ.get("CLOCK_E2E_PROVISION") != "1":
         pytest.skip("配网全流程测试会擦设备凭据并切换 PC 网卡，"
                     "要显式设置 CLOCK_E2E_PROVISION=1 才跑")
-    if _hotspot_on():
-        pytest.skip("PC 的移动热点开着 —— 此时无线网卡无法作为客户端连设备热点，先关掉它")
 
 
 def test_擦掉凭据后_客户端能从设备拿到_DHCP_地址(nvs_backup, wifi_restore, com_port):
@@ -165,12 +197,37 @@ def test_擦掉凭据后_客户端能从设备拿到_DHCP_地址(nvs_backup, wif
     _reset_device()
     time.sleep(6)  # 等 AP 起来
 
-    _netsh("wlan", "connect", f"name={DEVICE_AP}")
-    ip = _wait_wifi(DEVICE_AP, want_ip_prefix="192.168.4.")
+    # 关联失败会跳过，关联成功却拿不到地址会失败 —— 区别见 _connect_device_ap
+    _require_device_ap()
 
-    assert ip, (
-        f"连上 {DEVICE_AP} 但没拿到 192.168.4.x 的地址（当前 {_wifi_ip()!r}）—— "
-        "这正是 DHCP 应答发不出去时的症状，检查配网前有没有把 GIF 帧缓冲还给堆"
+
+def test_配网时堆余量足够发得出_DHCP_应答(nvs_backup, com_port):
+    """这条比断言现象更早报警。
+
+    lwIP 发不出去 DHCP ACK 那个 bug（客户端卡在「获取 IP 地址」）根因是内存：
+    115KB 的 GIF 帧缓冲开机常驻，把堆挤到分配不出发送缓冲，`udp_sendto`
+    返回 -1 (ERR_MEM)。等到有人拿手机去连、发现卡住，已经绕了一大圈。
+
+    这里直接守堆余量 —— 以后再往常驻内存里塞大块东西，这条会先红。
+
+    基线是实测的：配网模式下（帧缓冲已释放）最大连续块 58.0 KB、Free 153.4 KB。
+    联网模式下那 115KB 是按设计常驻的（留给 BOOT 键播 GIF），所以只能在
+    配网模式守。
+    """
+    _esptool("erase_region", hex(NVS_OFFSET), hex(NVS_SIZE))
+    log = _boot_log()
+
+    m = re.search(r"heap-after-free free=(\d+) largest=(\d+) dma_largest=(\d+)", log)
+    assert m, f"没抓到 heap-after-free 那行，启动日志：\n{log[-1200:]}"
+    free_kb = int(m.group(1)) / 1024
+    largest_kb = int(m.group(2)) / 1024
+
+    # 基线 58.0 KB，留 18 KB 余量。真退回「帧缓冲不释放」那种状态会差 115KB，
+    # 稳稳跌穿这条线。正常加功能用了十几 KB 内存也不会误报。
+    assert largest_kb >= 40, (
+        f"配网模式下最大连续块只有 {largest_kb:.1f} KB（基线 58.0 KB，下限 40 KB）—— "
+        f"lwIP 很可能分配不出 DHCP 发送缓冲，客户端会卡在「获取 IP 地址」，"
+        f"Free 堆 {free_kb:.1f} KB"
     )
 
 
@@ -210,8 +267,7 @@ def test_提交凭据后设备能连上并继续对时(nvs_backup, wifi_restore,
     _reset_device()
     time.sleep(6)
 
-    _netsh("wlan", "connect", f"name={DEVICE_AP}")
-    assert _wait_wifi(DEVICE_AP, want_ip_prefix="192.168.4."), "拿不到设备地址"
+    _require_device_ap()
 
     resp = requests.post(
         f"{PORTAL}/submit",

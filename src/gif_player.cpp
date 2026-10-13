@@ -179,8 +179,14 @@ void gifFreeFramebuffer() {
     gFb[half] = nullptr;
   }
   gFbIsDma = false;
-  ESP_LOGI(kTag, "帧缓冲已释放，最大连续块 %u 字节",
-           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+  // 前缀 `heap-after-free` 是给测试用的机器可读标记（tests/test_provision.py）——
+  // 配网时我们的 HTTP 服务还没起，拿不到 /debug/ticker，只能从串口日志断言堆余量。
+  // 那 115KB 要是没还回去，lwIP 发 DHCP ACK 时会分配不到内存（udp_sendto 返回
+  // -1 ERR_MEM），客户端就卡在「获取 IP 地址」。
+  ESP_LOGI(kTag, "heap-after-free free=%u largest=%u dma_largest=%u",
+           static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT)),
+           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
 }
 
 bool gifPlay(lgfx::LGFX_Device& lcd, const char* path) {
