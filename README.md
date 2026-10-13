@@ -112,6 +112,8 @@ static const Reminder kReminders[] = {
 
 > 配网页面本身也存在 LittleFS 里（`data/wifi_configuration*.html`），改完要跑 `pio run -t uploadfs` 才生效。
 
+> **想换到「本机自己开的热点」上时有个死循环**：要访问 `192.168.4.1` 得先关掉本机热点（否则无线网卡不能同时作客户端），可时钟又必须在提交那一刻热点已经开着。这时别走门户，直接写 NVS：造一份 `ssid`/`password` 的 CSV，用 IDF 的 `nvs_partition_gen.py` 生成镜像，刷到 `0x9000`（分区表里 nvs 区，大小 `0x6000`）。凭据格式见 `lib/esp-wifi-connect/ssid_manager.cc`（命名空间 `wifi`）。清凭据回配网模式：`esptool erase_region 0x9000 0x6000`。
+
 ## 换 GIF
 
 把 GIF 放进 `data/meme.gif` 后执行 `pio run -t uploadfs`。
