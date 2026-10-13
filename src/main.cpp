@@ -594,19 +594,79 @@ void startSntp() {
   drawStatus(COL_WAIT, "syncing time...");
 }
 
-// 把设备 IP 推到字幕行显示。Claude 一有输出就会顶掉它，所以不用做超时清除 ——
+// ==================== 单行提示轮播 ====================
+// 字幕行只有 240px、字号 24px，放不下十来个字；而它是尾巴对齐的（见 drawTicker），
+// 超宽只会从左边裁。实测「本机 192.168.1.77」宽 276px、「连热点 A 后浏览器打开 B」
+// 更宽 —— 两种情况下屏幕上都只剩个裸 IP 或网址，最该看的那半句反而没了。
+// 整个屏幕又只有这一条消息行（下面几行是时钟和日期），所以统一拆成
+// 「标签 / 取值」交替的短帧轮播：每帧都短到放得下，连起来读正好是一句完整提示。
+constexpr int kHintMaxFrames = 4;
+char gHintFrames[kHintMaxFrames][96] = {};
+uint16_t gHintMs[kHintMaxFrames] = {};
+int gHintCount = 0;
+int gHintIndex = 0;
+uint32_t gHintAt = 0;
+
+void showHint(const char* const* texts, const uint16_t* durations, int count) {
+  if (count > kHintMaxFrames) count = kHintMaxFrames;
+  for (int i = 0; i < count; ++i) {
+    snprintf(gHintFrames[i], sizeof(gHintFrames[i]), "%s", texts[i]);
+    gHintMs[i] = durations[i];
+  }
+  gHintCount = count;
+  gHintIndex = 0;
+  gHintAt = nowMs();
+
+  // 宽度是量出来的不是猜的：WIFI_AP_PREFIX 改长、或 IP 段变长都会静默裁字
+  lcd.setFont(&fonts::efontCN_24);
+  lcd.setTextSize(1.0f);
+  for (int i = 0; i < count; ++i) {
+    const int w = lcd.textWidth(gHintFrames[i]);
+    if (w > W - kTickerIndent) {
+      ESP_LOGW(kTag, "提示第 %d 帧「%s」宽 %dpx，超出可显示的 %dpx，会被裁掉", i,
+               gHintFrames[i], w, W - kTickerIndent);
+    }
+  }
+
+  replaceTickerText("boot", gHintFrames[0], static_cast<int>(strlen(gHintFrames[0])));
+}
+
+void stopHint() { gHintCount = 0; }
+
+// 只在 clockTask 里调用。
+void cycleHint() {
+  if (gHintCount == 0) return;
+  if (nowMs() - gHintAt < gHintMs[gHintIndex]) return;
+
+  // 这一行已经被别人（Claude 的输出）改写了，提示就到此为止，别再抢回来
+  bool preempted = false;
+  if (xSemaphoreTake(gTickerLock, pdMS_TO_TICKS(50)) != pdTRUE) return;
+  preempted = strcmp(gTickerText, gHintFrames[gHintIndex]) != 0;
+  xSemaphoreGive(gTickerLock);
+  if (preempted) {
+    stopHint();
+    return;
+  }
+
+  gHintAt = nowMs();
+  gHintIndex = (gHintIndex + 1) % gHintCount;
+  replaceTickerText("boot", gHintFrames[gHintIndex],
+                    static_cast<int>(strlen(gHintFrames[gHintIndex])));
+}
+
+// 把设备 IP 推到字幕行显示。Claude 一有输出就会顶掉它，所以不做超时清除 ——
 // 顺带的好处是没跑 Claude 时屏幕上一直能看到本机地址。
 void showIpOnTicker(const char* ip) {
-  char buf[64];
-  snprintf(buf, sizeof(buf), "本机 %s", ip);
-  replaceTickerText("boot", buf, static_cast<int>(strlen(buf)));
+  const char* texts[] = {"本机IP", ip};
+  const uint16_t ms[] = {2000, 4000};
+  showHint(texts, ms, 2);
 }
 
 // 配网模式时把热点名和配置网址显示出来。有屏就不必去翻串口日志。
 void showConfigPortalHint(const char* ap, const char* url) {
-  char buf[110];
-  snprintf(buf, sizeof(buf), "连热点 %s 后浏览器打开 %s", ap, url);
-  replaceTickerText("boot", buf, static_cast<int>(strlen(buf)));
+  const char* texts[] = {"连热点", ap, "浏览器打开", url};
+  const uint16_t ms[] = {1500, 3000, 1500, 3000};
+  showHint(texts, ms, 4);
 }
 
 void serviceNetwork() {
@@ -626,6 +686,7 @@ void serviceNetwork() {
     return;
   }
   apHintShown = false;
+  stopHint();
 
   // ---- 还没连上 ----
   if (!wifi.IsConnected()) {
@@ -807,6 +868,7 @@ void clockTask(void*) {
 
   for (;;) {
     serviceNetwork();
+    cycleHint();  // 配网提示和开机 IP 都靠它轮播
     refreshTicker();
 
     // 只要对过时就走内部 RTC，断网也继续显示
