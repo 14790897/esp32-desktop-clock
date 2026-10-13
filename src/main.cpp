@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -142,6 +143,11 @@ int16_t gHintWidths[kHintMaxFrames] = {};  // 量好的像素宽，量的时候�
 int gHintCount = 0;
 int gHintIndex = 0;
 uint32_t gHintAt = 0;
+
+// 「重新配网」请求。两个触发方（BOOT 长按、HTTP 端点）只置这个标志，
+// 实际动作由 clockTask 做 —— 它们各自的上下文里干重活会有并发问题。
+// 声明放这儿是因为 requestWifiReset() 定义得比按键回调早。
+volatile bool gWifiResetRequested = false;
 SemaphoreHandle_t gTickerLock = nullptr;
 
 // 行内绘制走精灵缓冲：直接往屏幕上「先清后画」会闪，而且 drawString 往屏幕
@@ -371,10 +377,12 @@ void initWifi() {
 }
 
 // ==================== HTTP 服务：接收 Claude 的输出 ====================
-// 只在局域网监听，三个端点：
-//   POST /say     body 是文本，整体替换（手动测试、一次性推送用）
-//   POST /append  body 是新增文本，追加到末尾（实时回显用）
-//   POST /state   body 为 "working" / "done" / "failed"，只决定字幕颜色
+// 只在局域网监听：
+//   POST /say           body 是文本，整体替换（手动测试、一次性推送用）
+//   POST /append        body 是新增文本，追加到末尾（实时回显用）
+//   POST /state         body 为 "working" / "done" / "failed"，只决定字幕颜色
+//   POST /wifi/reset    清掉已保存的 WiFi 并重启进配网模式
+//   GET  /debug/ticker  只读诊断快照，给 tests/ 用
 // PC 端由 Claude Code 的 hook 调用，见 tools/claude-status-hook.py
 
 // 把请求 body 读进 buf，返回实际字节数。超出 cap-1 的部分读掉丢弃 ——
@@ -569,6 +577,12 @@ const char* claudeStateName(ClaudeState s) {
 // 把字幕的当前状态以 JSON 吐出来，给 tests/ 里的 E2E 用例断言用。
 // 没有这个端点，HTTP 测试就只能断言「返回 200」—— 而「提示被裁成裸 IP」
 // 「颜色状态不对」「多会话串台」这些真踩过的坑一个都测不到。
+// 重新配网：清掉已保存的 WiFi 并重启，重启后 initWifi() 会进配网模式。
+//
+// 只置标志，真正的动作交给 clockTask —— 两个触发方（BOOT 长按、HTTP 端点）
+// 在各自的上下文里跑，让它们直接干重活会有并发问题。
+void requestWifiReset() { gWifiResetRequested = true; }
+
 esp_err_t handleDebugTicker(httpd_req_t* req) {
   // 快照必须在锁内取，否则可能读到写到一半的缓冲
   char text[kTickerCap];
@@ -634,6 +648,16 @@ esp_err_t handleDebugTicker(httpd_req_t* req) {
   return ESP_OK;
 }
 
+// 从局域网触发重新配网（清凭据 + 重启进配网模式）。
+// 除了方便（设备挂错网络时不用去够物理键），它的存在还有个实际原因：
+// BOOT 长按那条路没法自动化验证，而两条路走的是同一个动作。
+esp_err_t handleWifiReset(httpd_req_t* req) {
+  ESP_LOGW(kTag, "HTTP /wifi/reset：收到重新配网请求");
+  requestWifiReset();
+  httpd_resp_sendstr(req, "ok");
+  return ESP_OK;
+}
+
 bool startHttpServer() {
   if (gTickerLock == nullptr) {
     ESP_LOGE(kTag, "字幕锁未初始化");
@@ -641,7 +665,7 @@ bool startHttpServer() {
   }
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-  cfg.max_uri_handlers = 5;
+  cfg.max_uri_handlers = 6;
   cfg.lru_purge_enable = true;  // 连接堆积时回收最久未用的，避免句柄耗尽
 
   httpd_handle_t server = nullptr;
@@ -675,6 +699,13 @@ bool startHttpServer() {
   debugUri.method = HTTP_GET;
   debugUri.handler = handleDebugTicker;
   httpd_register_uri_handler(server, &debugUri);
+
+  // 重新配网（清凭据 + 重启）。和 BOOT 长按是同一个动作。
+  httpd_uri_t resetUri = {};
+  resetUri.uri = "/wifi/reset";
+  resetUri.method = HTTP_POST;
+  resetUri.handler = handleWifiReset;
+  httpd_register_uri_handler(server, &resetUri);
 
   ESP_LOGI(kTag, "HTTP 服务已启动，等待 Claude 输出");
   return true;
@@ -897,13 +928,19 @@ void initStorage() {
 
 // BOOT 键交给 ESP-IDF 官方按键驱动 iot_button：去抖、单击/长按/连击判定
 // 都由库负责，比自己写中断计数可靠，短按也不会漏。
-// 回调在库的任务上下文里跑，这里只累加计数，实际动作交给 clockTask。
+// 回调在库的任务上下文里跑，这里只置标志，实际动作交给 clockTask。
 volatile uint32_t gButtonClicks = 0;
+
+// 长按多久算「要重新配网」。比 Kconfig 默认的 1.5 秒长 —— 清掉凭据这个动作
+// 不该那么容易被误触，3 秒是个"故意按住"的时长。
+constexpr uint16_t kLongPressResetMs = 3000;
 
 void onButtonSingleClick(void*, void*) {
   // volatile 上的 ++ 在 C++20 已废弃，显式读改写
   gButtonClicks = gButtonClicks + 1;
 }
+
+void onButtonLongPress(void*, void*) { requestWifiReset(); }
 
 // 板子上 GPIO12/13 接着指示灯。这两脚在 ESP32-C3 上默认是内部 flash 的
 // SPIHD/SPIWP，但本板 flash 跑在 DIO 模式（启动日志 "SPI Mode : DIO"，只用
@@ -921,8 +958,8 @@ void initBoardLeds() {
 
 void initButton() {
   button_config_t cfg = {};
-  cfg.long_press_time = 0;   // 0 = 用 Kconfig 默认值
-  cfg.short_press_time = 0;
+  cfg.long_press_time = kLongPressResetMs;  // 长按 = 重新配网，见 onButtonLongPress
+  cfg.short_press_time = 0;                 // 0 = 用 Kconfig 默认值
 
   button_gpio_config_t gpioCfg = {};
   gpioCfg.gpio_num = kBootPin;
@@ -936,7 +973,9 @@ void initButton() {
     return;
   }
   iot_button_register_cb(btn, BUTTON_SINGLE_CLICK, nullptr, onButtonSingleClick, nullptr);
-  ESP_LOGI(kTag, "BOOT 键 gpio%d 就绪（iot_button）", static_cast<int>(kBootPin));
+  iot_button_register_cb(btn, BUTTON_LONG_PRESS_START, nullptr, onButtonLongPress, nullptr);
+  ESP_LOGI(kTag, "BOOT 键 gpio%d 就绪（短按播放 GIF，长按 %ums 重新配网）",
+           static_cast<int>(kBootPin), kLongPressResetMs);
 }
 
 // ==================== 定时提醒 ====================
@@ -995,6 +1034,23 @@ void clockTask(void*) {
     serviceNetwork();
     cycleHint();  // 配网提示和开机 IP 都靠它轮播
     refreshTicker();
+
+    // BOOT 长按 = 重新配网：清掉已保存的 WiFi，重启后自动进配网模式。
+    //
+    // 放在最前面而不是按键处理那块 —— 那里在 `!timeIsValid()` 之后，而配网模式
+    // 和「连上了但没有外网」这两种情况都取不到时间，放后面就永远轮不到。
+    if (gWifiResetRequested) {
+      gWifiResetRequested = false;
+      ESP_LOGW(kTag, "BOOT 长按 %ums：清除已保存的 WiFi，重启进配网模式",
+               static_cast<unsigned>(kLongPressResetMs));
+      // 重启后 initWifi() 会走配网分支并自己释放帧缓冲；这里先放一次，
+      // 免得重启前的这一小段窗口里堆是紧的
+      gifFreeFramebuffer();
+      drawStatus(COL_WAIT, "wifi reset...");
+      vTaskDelay(pdMS_TO_TICKS(800));  // 让屏幕上的提示看得见再重启
+      SsidManager::GetInstance().Clear();
+      esp_restart();
+    }
 
     // 只要对过时就走内部 RTC，断网也继续显示
     if (!timeIsValid()) {

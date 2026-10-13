@@ -252,6 +252,45 @@ def test_配网提示的每一帧都不超出屏幕(nvs_backup, com_port):
     )
 
 
+def test_调_wifi_reset_会清掉凭据并进配网模式(nvs_backup, com_port):
+    """BOOT 长按和 /wifi/reset 走的是同一个动作，这里验证后者。
+
+    按键那条路没法自动化（够不着物理键），所以两条路共用一个 requestWifiReset()，
+    测了端点就等于测了长按的核心逻辑。区别只在触发方式。
+    """
+    url = os.environ.get("CLAUDE_CLOCK_URL", "").strip()
+    if not url:
+        pytest.skip("未设置 CLAUDE_CLOCK_URL，不知道设备在哪")
+
+    # 设备刚被上一轮的 teardown 复位过，等它连上来
+    deadline = time.time() + 40
+    while time.time() < deadline:
+        try:
+            requests.get(f"{url.rstrip('/')}/debug/ticker", timeout=5)
+            break
+        except requests.RequestException:
+            time.sleep(2)
+    else:
+        pytest.skip(f"设备 {url} 没连上来，没法调 /wifi/reset")
+
+    r = requests.post(f"{url.rstrip('/')}/wifi/reset", timeout=15)
+    assert r.status_code == 200, f"返回 {r.status_code}"
+
+    # 等它把凭据清完并自己重启。不能立刻去读串口 —— pyserial 打开端口时会拉
+    # DTR/RTS，那等于复位设备，会抢在 clockTask 执行 Clear() 之前把它打断
+    # （实测就是这样：日志里看到它又连回了原网络，凭据根本没清）。
+    time.sleep(10)
+
+    log = _boot_log()
+    assert "Access Point started with SSID" in log, (
+        f"调了 /wifi/reset 但没进配网模式。日志：\n{log[-1200:]}"
+    )
+    # 凭据要真被清掉，否则下次重启又自己连回去了
+    assert "没有已保存的 WiFi" in log, (
+        f"进了配网模式但凭据似乎还在（应该有「没有已保存的 WiFi」）。日志：\n{log[-1200:]}"
+    )
+
+
 def test_提交凭据后设备能连上并继续对时(nvs_backup, wifi_restore, com_port):
     """完整往返：进配网 → 提交 → 连上 → 对时。
 
