@@ -1,4 +1,5 @@
 {
+  "_comment": "复制成 .claude/settings.local.json 即可启用（见 README）。全局安装则需要把脚本路径换成绝对路径，因为 ${CLAUDE_PROJECT_DIR} 在全局配置里展开成当前项目而非本项目。",
   "hooks": {
     "MessageDisplay": [
       {
@@ -7,18 +8,6 @@
             "type": "command",
             "command": "python",
             "args": ["${CLAUDE_PROJECT_DIR}/tools/claude-status-hook.py"]
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python",
-            "args": ["${CLAUDE_PROJECT_DIR}/tools/claude-status-hook.py"],
-            "async": true
           }
         ]
       }

@@ -13,3 +13,5 @@ lib/
 # PlatformIO 自动生成，勿纳入版本控制
 sdkconfig.esp32c3-clock
 src/CMakeLists.txt
+
+__pycache__/

@@ -22,11 +22,13 @@
 #include <cstring>
 #include <ctime>
 
-#include "gif_player.h"
 #include "button_gpio.h"
+#include "clock_config.h"
+#include "gif_player.h"
 #include "iot_button.h"
 #include "reminders.h"
-#include "secrets.h"
+#include "ssid_manager.h"
+#include "wifi_manager.h"
 
 static const char* kTag = "clock";
 
@@ -312,77 +314,45 @@ enum class Net : uint8_t { Wifi, Syncing, Ready };
 
 Net netState = Net::Wifi;
 bool sntpStarted = false;
-volatile bool reconnectPending = false;
-constexpr uint32_t kRetryIntervalMs = 5000;
+bool httpStarted = false;
+httpd_handle_t gHttpServer = nullptr;
+bool apHintShown = false;  // 配网提示只在进入配网模式时推一次
+
+// 有凭据但连不上多久后改入配网模式。留足时间给路由器重启之类的短暂故障，
+// 又不至于让换了网络的人一直干等。
+constexpr uint32_t kConfigApFallbackMs = 90000;
 
 uint32_t nowMs() { return static_cast<uint32_t>(esp_timer_get_time() / 1000ULL); }
 
 // NTP 成功前系统时间是 1970，用这个阈值区分
 bool timeIsValid() { return time(nullptr) > 1600000000; }
 
-bool wifiConnected() {
-  wifi_ap_record_t ap;
-  return esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
-}
+// WiFi 交给 78/esp-wifi-connect 组件的 WifiManager：凭据存在 NVS 里，连不上就
+// 自己开热点 + 起配置网页（默认中文界面），不再需要 secrets.h 写死账号密码。
+//
+// 代价是没有静态 IP —— 组件不支持（高级页只有 OTA 地址、发射功率、记住 BSSID），
+// 所以走 DHCP。连上后把 IP 显示在屏幕上，供设置 hook 的 CLAUDE_CLOCK_URL 用。
+void initWifi() {
+  WifiManagerConfig cfg;
+  cfg.ssid_prefix = WIFI_AP_PREFIX;      // 配网热点名形如 esp32-clock-A1B2
+  cfg.language = "zh-CN";
+  cfg.station_hostname = WIFI_HOSTNAME;  // 向路由器注册的主机名，部分路由器可据此解析
 
-// 关联成功不等于能上网，DHCP 拿到地址前启动 SNTP 会连不上服务器
-bool wifiHasIp() {
-  esp_netif_ip_info_t ip = {};
-  if (esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip) != ESP_OK) {
-    return false;
+  WifiManager& wifi = WifiManager::GetInstance();
+  if (!wifi.Initialize(cfg)) {
+    ESP_LOGE(kTag, "WiFi 初始化失败");
+    return;
   }
-  return ip.ip.addr != 0;
-}
 
-void onWifiEvent(void*, esp_event_base_t base, int32_t id, void*) {
-  if (base != WIFI_EVENT) return;
-  if (id == WIFI_EVENT_STA_START) {
-    esp_wifi_connect();
-  } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
-    // 只置标志，实际重连交给 clockTask 限速执行，
-    // 避免在握手进行中再次调用 esp_wifi_connect 把连接打断
-    reconnectPending = true;
+  // 没有任何已保存的凭据就直接进配网模式。
+  // 注意组件**不会**在连接失败后自动切到配网 —— 实测它只会一直重试扫描（10s/20s 退避），
+  // 所以这个判断必须由应用自己做，组件 README 里也是这么示范的。
+  if (SsidManager::GetInstance().GetSsidList().empty()) {
+    ESP_LOGI(kTag, "没有已保存的 WiFi，进入配网模式");
+    wifi.StartConfigAp();
+  } else {
+    wifi.StartStation();
   }
-}
-
-// 固定 IP：Claude Code 的 hook 要按固定地址推送，而 DHCP 分配的地址重启后可能变，
-// 地址一变推送就发丢了。代价是设备只能用在 192.168.137.x 网段（Windows 移动热点的
-// ICS 网段）。要拿到别的网络用，把下面这行注释掉即可退回 DHCP。
-#define CLOCK_USE_STATIC_IP
-
-bool wifiStart() {
-  if (nvs_flash_init() != ESP_OK) return false;
-  ESP_ERROR_CHECK(esp_netif_init());
-  ESP_ERROR_CHECK(esp_event_loop_create_default());
-  esp_netif_create_default_wifi_sta();
-
-  wifi_init_config_t initCfg = WIFI_INIT_CONFIG_DEFAULT();
-  ESP_ERROR_CHECK(esp_wifi_init(&initCfg));
-  ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, onWifiEvent, nullptr));
-
-  wifi_config_t staCfg = {};
-  snprintf(reinterpret_cast<char*>(staCfg.sta.ssid), sizeof(staCfg.sta.ssid), "%s", WIFI_SSID);
-  snprintf(reinterpret_cast<char*>(staCfg.sta.password), sizeof(staCfg.sta.password), "%s",
-           WIFI_PASSWORD);
-
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &staCfg));
-
-#ifdef CLOCK_USE_STATIC_IP
-  {
-    esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    esp_netif_dhcpc_stop(sta);
-    esp_netif_ip_info_t info = {};
-    IP4_ADDR(&info.ip, 192, 168, 137, 50);
-    IP4_ADDR(&info.gw, 192, 168, 137, 1);
-    IP4_ADDR(&info.netmask, 255, 255, 255, 0);
-    esp_netif_set_ip_info(sta, &info);
-    ESP_LOGI(kTag, "使用固定 IP 192.168.137.50");
-  }
-#endif
-
-  ESP_ERROR_CHECK(esp_wifi_start());
-  return true;
 }
 
 // ==================== HTTP 服务：接收 Claude 的输出 ====================
@@ -477,6 +447,10 @@ void appendTickerText(const char* sid, const char* s, int len) {
   }
   memcpy(gTickerText + cur, s, len);
   gTickerText[cur + len] = '\0';
+  // 有文字流进来就说明这个会话正在工作 —— 状态由数据流推导，
+  // 不依赖单独的「开始工作」信号。那个信号走的是异步 hook，可能比第一批
+  // 文字到得还晚，结果就是工作中却显示着上一轮的「已完成」绿色。
+  gClaudeState = ClaudeState::Working;
   gTickerDirty = true;
   xSemaphoreGive(gTickerLock);
 }
@@ -541,9 +515,8 @@ esp_err_t handleState(httpd_req_t* req) {
 }
 
 bool startHttpServer() {
-  gTickerLock = xSemaphoreCreateMutex();
   if (gTickerLock == nullptr) {
-    ESP_LOGE(kTag, "创建字幕锁失败");
+    ESP_LOGE(kTag, "字幕锁未初始化");
     return false;
   }
 
@@ -556,6 +529,7 @@ bool startHttpServer() {
     ESP_LOGE(kTag, "HTTP 服务启动失败");
     return false;
   }
+  gHttpServer = server;
 
   httpd_uri_t sayUri = {};
   sayUri.uri = "/say";
@@ -577,6 +551,16 @@ bool startHttpServer() {
 
   ESP_LOGI(kTag, "HTTP 服务已启动，等待 Claude 输出");
   return true;
+}
+
+// 配网页也要绑 80 端口，而组件的 httpd_start 用的是 ESP_ERROR_CHECK —— 端口被占时
+// 它直接 abort 而不是返回错误。所以进配网前必须先把我们这个服务停掉。
+void stopHttpServer() {
+  if (gHttpServer == nullptr) return;
+  httpd_stop(gHttpServer);
+  gHttpServer = nullptr;
+  httpStarted = false;
+  ESP_LOGI(kTag, "HTTP 服务已停止，让出 80 端口给配网页面");
 }
 
 void startSntp() {
@@ -610,50 +594,90 @@ void startSntp() {
   drawStatus(COL_WAIT, "syncing time...");
 }
 
-void serviceNetwork() {
-  static uint32_t lastRetry = 0;
+// 把设备 IP 推到字幕行显示。Claude 一有输出就会顶掉它，所以不用做超时清除 ——
+// 顺带的好处是没跑 Claude 时屏幕上一直能看到本机地址。
+void showIpOnTicker(const char* ip) {
+  char buf[64];
+  snprintf(buf, sizeof(buf), "本机 %s", ip);
+  replaceTickerText("boot", buf, static_cast<int>(strlen(buf)));
+}
 
-  if (wifiConnected()) {
-    reconnectPending = false;
-    if (!wifiHasIp()) return;  // 关联上了但 DHCP 还没下发地址，继续等
-    if (!sntpStarted) {
-      esp_netif_ip_info_t ip = {};
-      esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip);
-      ESP_LOGI(kTag, "wifi up, ip=" IPSTR, IP2STR(&ip.ip));
-      startHttpServer();
-      startSntp();
-      return;
+// 配网模式时把热点名和配置网址显示出来。有屏就不必去翻串口日志。
+void showConfigPortalHint(const char* ap, const char* url) {
+  char buf[110];
+  snprintf(buf, sizeof(buf), "连热点 %s 后浏览器打开 %s", ap, url);
+  replaceTickerText("boot", buf, static_cast<int>(strlen(buf)));
+}
+
+void serviceNetwork() {
+  WifiManager& wifi = WifiManager::GetInstance();
+  static uint32_t tryingSince = 0;
+
+  // ---- 配网模式：设备自己开着热点等配置 ----
+  if (wifi.IsConfigMode()) {
+    if (!apHintShown) {
+      apHintShown = true;
+      const std::string ap = wifi.GetApSsid();
+      const std::string url = wifi.GetApWebUrl();
+      ESP_LOGI(kTag, "进入配网模式：热点 %s，浏览器打开 %s", ap.c_str(), url.c_str());
+      showConfigPortalHint(ap.c_str(), url.c_str());
     }
-    if (netState == Net::Syncing) {
-      if (timeIsValid()) {
-        netState = Net::Ready;
-        drawStatus(COL_OK, nullptr);
-        const time_t now = time(nullptr);
-        struct tm t;
-        localtime_r(&now, &t);
-        ESP_LOGI(kTag, "time synced: %04d-%02d-%02d %02d:%02d:%02d", t.tm_year + 1900,
-                 t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
-      } else {
-        static uint32_t lastLog = 0;
-        if (nowMs() - lastLog >= 5000) {
-          lastLog = nowMs();
-          ESP_LOGW(kTag, "still syncing, epoch=%lld", static_cast<long long>(time(nullptr)));
-        }
-      }
+    netState = Net::Wifi;
+    return;
+  }
+  apHintShown = false;
+
+  // ---- 还没连上 ----
+  if (!wifi.IsConnected()) {
+    if (netState != Net::Wifi) {
+      netState = Net::Wifi;
+      drawStatus(COL_WAIT, "wifi lost, retrying...");
+      ESP_LOGW(kTag, "wifi disconnected");
+    }
+    // 有凭据却一直连不上（换了网络、改了密码、路由器没开）：超时后自动进配网，
+    // 否则设备就再也配不了了，只能重新烧录固件
+    if (tryingSince == 0) tryingSince = nowMs();
+    if (nowMs() - tryingSince >= kConfigApFallbackMs) {
+      ESP_LOGW(kTag, "连接超时，改入配网模式");
+      tryingSince = 0;
+      stopHttpServer();
+      wifi.StartConfigAp();
     }
     return;
   }
+  tryingSince = 0;
 
-  if (netState != Net::Wifi) {
-    netState = Net::Wifi;
-    drawStatus(COL_WAIT, "wifi lost, retrying...");
-    ESP_LOGW(kTag, "wifi disconnected");
+  // ---- 刚连上：记录 IP、起服务、开始对时 ----
+  if (netState == Net::Wifi) {
+    const std::string ip = wifi.GetIpAddress();
+    ESP_LOGI(kTag, "wifi up, ssid=%s ip=%s", wifi.GetSsid().c_str(), ip.c_str());
+    showIpOnTicker(ip.c_str());
+
+    // 只在成功时置位：配网刚结束时组件的 httpd 可能还没释放 80 端口，
+    // 这一轮起不来下一轮还会再试
+    if (!httpStarted) httpStarted = startHttpServer();
+    if (!sntpStarted) startSntp();  // 掉线重连时不要重复初始化 SNTP
+    netState = Net::Syncing;
+    return;
   }
-  if (reconnectPending && nowMs() - lastRetry >= kRetryIntervalMs) {
-    reconnectPending = false;
-    lastRetry = nowMs();
-    ESP_LOGI(kTag, "reconnecting to %s", WIFI_SSID);
-    esp_wifi_connect();
+
+  // ---- 等对时 ----
+  if (netState == Net::Syncing) {
+    if (timeIsValid()) {
+      netState = Net::Ready;
+      drawStatus(COL_OK, nullptr);
+      const time_t now = time(nullptr);
+      struct tm t;
+      localtime_r(&now, &t);
+      ESP_LOGI(kTag, "time synced: %04d-%02d-%02d %02d:%02d:%02d", t.tm_year + 1900,
+               t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+    } else {
+      static uint32_t lastLog = 0;
+      if (nowMs() - lastLog >= 5000) {
+        lastLog = nowMs();
+        ESP_LOGW(kTag, "still syncing, epoch=%lld", static_cast<long long>(time(nullptr)));
+      }
+    }
   }
 }
 
@@ -878,6 +902,13 @@ extern "C" void app_main(void) {
     ESP_LOGE(kTag, "字幕行缓冲创建失败，滚动字幕不可用");
   }
 
+  // 字幕锁要在这里就建好，不能等到起 HTTP 服务时 —— 配网模式下 HTTP 服务不会启动，
+  // 而配网提示要往字幕里写字；那时锁还是 NULL，xSemaphoreTake(NULL) 会直接 assert 重启
+  gTickerLock = xSemaphoreCreateMutex();
+  if (gTickerLock == nullptr) {
+    ESP_LOGE(kTag, "创建字幕锁失败");
+  }
+
   // 先挂载文件系统再起 WiFi：littlefs 挂载要分配缓存，而 WiFi 栈启动后会
   // 吃掉大量堆内存，放在后面挂载会因分配失败而挂不上
   initStorage();
@@ -886,7 +917,7 @@ extern "C" void app_main(void) {
   gifInitFramebuffer();
 
   drawStatus(COL_WAIT, "connecting wifi...");
-  wifiStart();
+  initWifi();
 
   // 栈开到 8K：播放 GIF 时要在本任务里跑文件 IO 和逐行解码
   xTaskCreate(clockTask, "clock", 8192, nullptr, 4, nullptr);

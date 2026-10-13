@@ -43,7 +43,7 @@ pio run -t uploadfs    # 把 data/ 打包成 LittleFS 镜像烧进去（首次�
 pio monitor            # 看串口日志
 ```
 
-首次烧录后如果屏幕一直显示 `connecting wifi...`，是正常的 —— 还没配 WiFi，见下节。
+首次烧录后如果屏幕显示 `连热点 esp32-clock-XXXX 后浏览器打开 http://192.168.4.1`，是正常的 —— 还没配 WiFi，见下节。
 
 ### 依赖
 
@@ -55,6 +55,7 @@ pio monitor            # 看串口日志
 | `lib/AnimatedGIF` | https://github.com/bitbank2/AnimatedGIF | 2.2.0 |
 | `lib/esp_littlefs` | https://github.com/joltwallet/esp_littlefs | v1.22.3 |
 | `lib/esp_button` | https://github.com/espressif/esp-iot-solution 的 `components/button` | 4.2.1 |
+| `lib/esp-wifi-connect` | https://github.com/78/esp-wifi-connect | v3.3.1 |
 
 两个容易踩的坑：
 
@@ -63,17 +64,20 @@ pio monitor            # 看串口日志
 
 **下载后还有几处本地改动要重做**（清单写在 `platformio.ini` 顶部注释里）：给 LovyanGFX 加 `srcFilter` 排除未编译的日韩台湾字体、给 AnimatedGIF 加 ESP-IDF 分支、给 esp_littlefs 排除仅 IDF 6+ 需要的源文件等。不照做的话编译不过或构建极慢。
 
+`lib/esp-wifi-connect` 还有一处必改：原版用 CMake `EMBED_TXTFILES` 把配网页打进固件，而 **PlatformIO 不处理组件自带的 CMakeLists**，那两个 `_binary_*_start` 符号不会生成。已改成从 LittleFS 分块读（见 `wifi_configuration_ap.cc` 里的 `send_html_file()` 与 `WIFI_AP_INDEX_HTML`）。
+
 ## 配置
 
 日常只需要改两个文件：
 
-**`include/secrets.h`** —— WiFi 与对时（该文件已被 `.gitignore` 排除，不会进版本库）
+**`include/clock_config.h`** —— 对时与配网（不含隐私，已进版本库）
 
 ```cpp
-#define WIFI_SSID       "你的WiFi名称"
-#define WIFI_PASSWORD   "你的WiFi密码"
-#define NTP_SERVER_1    "203.107.6.88"   // ntp.aliyun.com
-#define TZ_INFO         "CST-8"
+#define NTP_SERVER_1   "203.107.6.88"     // ntp.aliyun.com
+#define NTP_SERVER_2   "162.159.200.123"  // cn.pool.ntp.org
+#define TZ_INFO        "CST-8"            // 东八区
+#define WIFI_AP_PREFIX "esp32-clock"      // 配网热点名前缀
+#define WIFI_HOSTNAME  "esp32-clock"      // 向路由器注册的主机名
 ```
 
 > NTP 服务器写的是**IP 不是域名**：Windows 移动热点之类的网络里 DNS 代理常常不应答非 Windows 客户端（实测 `getaddrinfo` 返回 `EAI_FAIL`），而 SNTP 解析失败时**不报错**，只会静默地永远同步不上。
@@ -88,6 +92,23 @@ static const Reminder kReminders[] = {
 
 #define REMINDER_SHOW_SECONDS 60
 ```
+
+## WiFi 配网
+
+**WiFi 账号密码不写死在代码里**，设备自己记在 NVS 里（用 [esp-wifi-connect](https://github.com/78/esp-wifi-connect) 的配网门户，MIT）。
+
+首次上电，或换到一个没记录过的网络：
+
+1. 设备连不上就自己开热点，名字形如 `esp32-clock-5745`，无密码
+2. 屏幕顶部显示热点名 —— 手机连上这个热点
+3. 浏览器打开 **http://192.168.4.1**（页面自带 DNS 劫持，多数手机会自动弹出）
+4. 页面里选一个 2.4G 网络、输密码、保存（ESP32-C3 不支持 5G）
+
+连上后**屏幕顶部会显示约 10 秒拿到的 IP** —— 这个地址要填给 Claude hook 用（见下）。
+
+之后每次开机直接连，不再进配网。想换网络：把设备拿到没有旧网络的地方开机，连不上 90 秒后会自动重新进配网模式。
+
+> 配网页面本身也存在 LittleFS 里（`data/wifi_configuration*.html`），改完要跑 `pio run -t uploadfs` 才生效。
 
 ## 换 GIF
 
@@ -117,9 +138,8 @@ static const Reminder kReminders[] = {
 
 ### 启用步骤
 
-**1. 让时钟连上网络。** 固件默认用静态 IP `192.168.137.50`（适配 Windows 移动热点的
-ICS 网段）。如果你的网络不是这个网段，把 `src/main.cpp` 里的 `#define CLOCK_USE_STATIC_IP`
-注释掉退回 DHCP，烧录后从串口日志读实际 IP。
+**1. 拿到时钟的 IP。** 设备配好网后，**屏幕顶部会显示约 10 秒它拿到的 IP**，记下来。
+（没看到就断电重开，或者去路由器后台按主机名 `esp32-clock` 查。）
 
 **2. 建 hook 配置。** 模板在 `tools/claude-hooks.example.json`，两种装法：
 
@@ -144,7 +164,7 @@ cp tools/claude-hooks.example.json .claude/settings.local.json
 > 项目级文件被 `.gitignore` 排除，不会随仓库分发 —— 别人克隆后不会平白多出一个
 > 指向不存在设备的本地服务。要启用就得显式装一次。
 
-**3. 时钟地址不是默认值时**，设环境变量：
+**3. 填时钟地址**（第 1 步里记下的 IP），设环境变量：
 
 ```bash
 CLAUDE_CLOCK_URL=http://192.168.1.77
@@ -154,12 +174,12 @@ CLAUDE_CLOCK_URL=http://192.168.1.77
 
 ### 手动测试
 
-不用等 Claude，直接 curl 就能验证链路：
+不用等 Claude，直接 curl 就能验证链路（把 IP 换成时钟实际地址）：
 
 ```bash
-curl -X POST -d '测试文字' http://192.168.137.50/say      # 整体替换
-curl -X POST -d '追加的文字' http://192.168.137.50/append  # 追加（实时回显用）
-curl -X POST -d working   http://192.168.137.50/state     # 状态：working/done/failed
+curl -X POST -d '测试文字' http://192.168.1.77/say      # 整体替换
+curl -X POST -d '追加的文字' http://192.168.1.77/append  # 追加（实时回显用）
+curl -X POST -d working   http://192.168.1.77/state     # 状态：working/done/failed
 ```
 
 ### 注意
@@ -175,6 +195,7 @@ curl -X POST -d working   http://192.168.137.50/state     # 状态：working/don
 - **中文点阵字库占 554KB flash**，所以分区表用了自定义的 `partitions.csv`（app 区 2MB），默认分区表 1MB 装不下。
 - **GIF 播放需要 115KB 帧缓冲**，且必须 DMA 可访问 —— 实测堆里凑不出连续的 115200 字节，所以拆成了上下两块各 57600 字节。
 - GIF 画面与时钟不能同时显示，播放期间时钟暂停刷新。
+- **配网页面不支持设静态 IP**（esp-wifi-connect 的 Advanced 页只有 OTA 地址、发射功率、记住 BSSID 三项），所以设备走 DHCP。IP 变了要重新填 `CLAUDE_CLOCK_URL` —— 可以在路由器上按 `esp32-clock` 这个主机名绑一个固定地址。
 
 ## 参考资料
 

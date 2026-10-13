@@ -8,6 +8,10 @@
   Stop            一轮回答结束
                   → 用完整文本兜底替换一次，再标记「已完成」（字幕转绿）
 
+字幕颜色由设备端从数据流推导：收到文字就是「正在工作」（琥珀），收到 Stop 就是
+「已完成」（绿）。因此**不需要** UserPromptSubmit 之类的开工信号 —— 那个 hook 只能
+异步跑，可能比第一批文字到得还晚，反而会把颜色卡在上一轮的状态上。
+
 设计约束：
 - MessageDisplay 是**同步**的 —— Claude 会等钩子返回，所以超时必须短。
   用 async 反而会让批次乱序到达，字幕就乱了。
@@ -23,10 +27,10 @@ import time
 import urllib.error
 import urllib.request
 
-# 时钟地址。默认值对应固件里 CLOCK_USE_STATIC_IP 配的固定 IP；
-# 如果你的网络不是 192.168.137.x 网段，改固件的静态 IP 配置并在这里设环境变量：
-#     CLAUDE_CLOCK_URL=http://<时钟地址>
-DEVICE = os.environ.get("CLAUDE_CLOCK_URL", "http://192.168.137.50")
+# 时钟地址。必须用环境变量指定 —— 设备走 DHCP，地址会变，写死一个默认值只会
+# 让 hook 静默地连到一台不存在的机器上。屏幕配网后会在顶部显示 10 秒实际 IP。
+#     CLAUDE_CLOCK_URL=http://192.168.1.77
+DEVICE = os.environ.get("CLAUDE_CLOCK_URL", "").rstrip("/")
 
 # 兜底替换时的文字上限（字符数）。设备端的显示缓冲只有 1KB，
 # 而且屏幕是尾巴对齐的，多送的部分根本显示不出来。
@@ -85,6 +89,15 @@ def tail(text: str, limit: int) -> str:
 
 
 def main() -> None:
+    if not DEVICE:
+        print(
+            "claude-status-hook: 未设置 CLAUDE_CLOCK_URL，时钟回显已跳过。"
+            "设备配网后屏幕顶部会显示 10 秒实际 IP，"
+            "把它设成 CLAUDE_CLOCK_URL=http://<IP> 即可。",
+            file=sys.stderr,
+        )
+        return
+
     try:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -98,13 +111,11 @@ def main() -> None:
     q = f"?sid={sid}" if sid else ""
 
     if event == "MessageDisplay":
-        # 逐批追加，不截断 —— 设备端自己会丢掉超出缓冲的老内容
+        # 逐批追加，不截断 —— 设备端自己会丢掉超出缓冲的老内容。
+        # 设备收到文字就认为「正在工作」，所以不需要单独的开工信号。
         delta = flatten(payload.get("delta") or "")
         if delta:
             post("/append" + q, delta)
-
-    elif event == "UserPromptSubmit":
-        post("/state" + q, "working")
 
     elif event == "Stop":
         # 流式过程中已经追加过了，这里用完整文本兜底替换一次，
