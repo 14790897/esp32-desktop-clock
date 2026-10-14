@@ -40,7 +40,8 @@ constexpr int W = SCREEN_WIDTH;
 constexpr int H = SCREEN_HEIGHT;
 
 // ==================== 显示 ====================
-// ST7789 240x240，总线与面板参数沿用 gallery-pro 的实测配置
+// ST7789 240x240。引脚与面板参数均为本机实测，不是照抄现成配置 ——
+// 见 README「硬件接线」开头那条警告（DC/CS/RST 是轮换关系，照抄会黑屏）。
 class ClockDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_ST7789 panel_;
   lgfx::Bus_SPI bus_;
@@ -1140,8 +1141,8 @@ extern "C" void app_main(void) {
   // 真正的开关在 components/lwip/apps/dhcpserver/dhcpserver.c 里的
   // DHCPS_DEBUG，已临时改成 1，改完要一起还原。
 
-  // 不主动驱动 TFT_BL：gallery-pro 全程未使用该引脚，屏幕仍正常点亮，
-  // 说明背光由硬件自行处理（接 VCC 或默认导通），软件干预反而可能关掉它
+  // 不主动驱动 TFT_BL：不接该引脚屏幕也正常点亮，说明背光由硬件自行处理
+  // （接 VCC 或默认导通），软件干预反而可能关掉它（实测拉高后全黑）
   ESP_LOGI(kTag, "TFT_BL=gpio%d 交由硬件处理，软件不驱动", TFT_BL);
 
   lcd.setColorDepth(16);

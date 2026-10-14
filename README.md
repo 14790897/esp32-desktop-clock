@@ -15,7 +15,7 @@ WiFi 自动对时、大号数字表盘、中文定时提醒，按 BOOT 键还能
 
 ## 硬件接线
 
-实测引脚如下（注意：这与 [gallery-pro](https://github.com/14790897/gallery-pro) 的 `env:airm2m_core_esp32c3_240x240` 原文**不一致**，DC/CS/RST 三个脚是轮换关系，照抄 gallery-pro 会黑屏）：
+实测引脚如下（注意：常见的 `airm2m_core_esp32c3_240x240` 配置写的是 **DC=6 / CS=7 / RST=10**，与本机实测**不一致** —— 这三个脚是轮换关系，照抄那套会黑屏）：
 
 | 屏幕 | ESP32-C3 |
 |---|---|
@@ -283,4 +283,5 @@ pytest tests/test_provision.py -v
 
 ## 参考资料
 
-硬件配置参考了 [14790897/gallery-pro](https://github.com/14790897/gallery-pro)，但引脚以本仓库实测值为准。
+- [espressif/esp-idf#12580](https://github.com/espressif/esp-idf/issues/12580) —— 软 AP 的 DHCP 服务器因 UDP 广播丢失而出问题。本项目「客户端卡在获取 IP 地址」那个坑的官方记录（我们的根因是内存，不完全相同，但同一段代码）。
+- 引脚与面板参数**均为本机实测**，不是照抄现成配置 —— 见「硬件接线」开头那条警告。
