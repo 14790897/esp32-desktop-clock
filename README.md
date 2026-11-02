@@ -2,11 +2,13 @@
 
 合宙 AirM2M Core ESP32-C3 + ST7789 240×240 方屏做的桌面小时钟。
 
-WiFi 自动对时、大号数字表盘、中文定时提醒，按 BOOT 键还能播一段 GIF。
+**通信全走蓝牙**：PC 连上它推时间、推 Claude Code 的输出。没有 WiFi，也就没有配网、DHCP、IP 地址漂移这一整套问题。
+
+> **代价**：蓝牙上不了互联网，所以时钟的时间来自 PC。PC 关机或不在蓝牙范围内时，时钟靠内部 RTC 继续走（会慢慢漂），PC 一回来就自动校正。
 
 ## 功能
 
-- **NTP 自动对时** —— 上电连 WiFi 后取网络时间，之后走内部 RTC；断网也继续走时
+- **时间由 PC 推送** —— 连上时推一次，之后每 5 分钟一次
 - **大号数字表盘** —— `HH:MM` 自适应缩放铺满屏宽，下方是秒和日期
 - **中文定时提醒** —— 到点整屏显示提醒语，默认 11:59 提醒吃饭、17:59 提醒下班
 - **BOOT 键播 GIF** —— 按一下播一遍，播完自动回到时钟
@@ -43,7 +45,7 @@ pio run -t uploadfs    # 把 data/ 打包成 LittleFS 镜像烧进去（首次�
 pio monitor            # 看串口日志
 ```
 
-首次烧录后如果屏幕顶部在 `连热点` / `esp32-clock-XXXX` / `浏览器打开` / `192.168.4.1` 之间轮播，是正常的 —— 还没配 WiFi，见下节。
+烧完后设备会广播名为 **`esp32-clock`** 的 BLE 外设。这时屏幕显示 `waiting for BLE...`，等 PC 连上推时间。
 
 ### 依赖
 
@@ -55,7 +57,6 @@ pio monitor            # 看串口日志
 | `lib/AnimatedGIF` | https://github.com/bitbank2/AnimatedGIF | 2.2.0 |
 | `lib/esp_littlefs` | https://github.com/joltwallet/esp_littlefs | v1.22.3 |
 | `lib/esp_button` | https://github.com/espressif/esp-iot-solution 的 `components/button` | 4.2.1 |
-| `lib/esp-wifi-connect` | https://github.com/78/esp-wifi-connect | v3.3.1 |
 
 两个容易踩的坑：
 
@@ -64,23 +65,15 @@ pio monitor            # 看串口日志
 
 **下载后还有几处本地改动要重做**（清单写在 `platformio.ini` 顶部注释里）：给 LovyanGFX 加 `srcFilter` 排除未编译的日韩台湾字体、给 AnimatedGIF 加 ESP-IDF 分支、给 esp_littlefs 排除仅 IDF 6+ 需要的源文件等。不照做的话编译不过或构建极慢。
 
-`lib/esp-wifi-connect` 还有一处必改：原版用 CMake `EMBED_TXTFILES` 把配网页打进固件，而 **PlatformIO 不处理组件自带的 CMakeLists**，那两个 `_binary_*_start` 符号不会生成。已改成从 LittleFS 分块读（见 `wifi_configuration_ap.cc` 里的 `send_html_file()` 与 `WIFI_AP_INDEX_HTML`）。
-
 ## 配置
 
-日常只需要改两个文件：
-
-**`include/clock_config.h`** —— 对时与配网（不含隐私，已进版本库）
+**`include/clock_config.h`** —— 只放不含隐私的配置，已进版本库
 
 ```cpp
-#define NTP_SERVER_1   "203.107.6.88"     // ntp.aliyun.com
-#define NTP_SERVER_2   "162.159.200.123"  // cn.pool.ntp.org
-#define TZ_INFO        "CST-8"            // 东八区
-#define WIFI_AP_PREFIX "esp32-clock"      // 配网热点名前缀
-#define WIFI_HOSTNAME  "esp32-clock"      // 向路由器注册的主机名
+#define TZ_INFO "CST-8"   // POSIX 时区，东八区。只影响 localtime_r 的换算
 ```
 
-> NTP 服务器写的是**IP 不是域名**：Windows 移动热点之类的网络里 DNS 代理常常不应答非 Windows 客户端（实测 `getaddrinfo` 返回 `EAI_FAIL`），而 SNTP 解析失败时**不报错**，只会静默地永远同步不上。
+时间本身不在这里配 —— 由 PC 通过蓝牙推送。
 
 **`include/reminders.h`** —— 定时提醒
 
@@ -93,45 +86,64 @@ static const Reminder kReminders[] = {
 #define REMINDER_SHOW_SECONDS 60
 ```
 
-## WiFi 配网
+**`sdkconfig.defaults`** —— 蓝牙/无线配置
 
-**WiFi 账号密码不写死在代码里**，设备自己记在 NVS 里（用 [esp-wifi-connect](https://github.com/78/esp-wifi-connect) 的配网门户，MIT）。
+```ini
+# CONFIG_ESP_WIFI_ENABLED is not set   # 不用 WiFi，省 flash 和 RAM
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
+```
 
-首次上电，或换到一个没记录过的网络：
+> lwIP 不能一起关：`esp-tls` 等组件依赖它的 `sys/socket.h`，关掉会编译失败。没有 netif 在用，它基本只是躺在那儿。
 
-1. 设备连不上就自己开热点，名字形如 `esp32-clock-5745`，无密码
-2. 屏幕顶部显示热点名 —— 手机连上这个热点
-3. 浏览器打开 **http://192.168.4.1**（页面自带 DNS 劫持，多数手机会自动弹出）
-4. 页面里选一个 2.4G 网络、输密码、保存（ESP32-C3 不支持 5G）
+## 连接与时间同步
 
-连上后屏幕顶部会在 **`本机IP` / 拿到的 IP** 之间轮播 —— 这个地址要填给 Claude hook 用（见下）。Claude 一开始输出就会把它顶掉。
+设备是 BLE 外设，广播名 `esp32-clock`。PC 侧跑一个常驻守护进程：
 
-之后每次开机直接连，不再进配网。
+```bash
+pip install bleak
+python tools/clock-ble-daemon.py
+```
 
-### 重新配网
+它做三件事：
 
-换网络有三种触发方式，任选：
+1. 扫描并连上 `esp32-clock`（断了自动重连）
+2. 连上时推一次时间，之后每 5 分钟一次
+3. 在 `127.0.0.1:8765` 上收本机命令，转发到 BLE
 
-| 方式 | 怎么做 | 适用 |
+**为什么需要守护进程**：Claude 的 `MessageDisplay` 钩子在关键路径上，超时预算只有 0.6 秒；而 BLE 建连要一两秒。所以钩子只往本机 socket 写一行，真正的连接由守护进程长期持有。
+
+### 开机自启
+
+守护进程不开机自启的话，每次重启电脑都要手动跑一次。放一个快捷方式到启动文件夹即可（不需要管理员）：
+
+```
+Win+R → shell:startup → 在里面新建快捷方式，目标：
+pythonw.exe "C:\git-program\esp32-clock\tools\clock-ble-daemon.py"
+```
+
+## BLE 协议
+
+服务和特征都是 128 位 UUID（`BLE_UUID128_INIT` 是小端，见 `src/ble_clock.cpp` 顶部的说明）：
+
+```
+服务   7d9f0001-5a3e-4c1b-9e21-6b0c4c4f4b00
+  ├─ CMD    7d9f0002-…   write        指令
+  └─ STATUS 7d9f0003-…   read/notify  当前字幕状态（JSON）
+```
+
+CMD 负载是 `[opcode][body]`：
+
+| op | body | 作用 |
 |---|---|---|
-| **BOOT 长按 3 秒** | 按住板上 BOOT 键，屏幕显示 `wifi reset...` 后松手 | 设备够得着，最省事 |
-| **`POST /wifi/reset`** | `curl -X POST http://<时钟IP>/wifi/reset` | 设备在别的房间 / 想脚本化 |
-| **等超时** | 拿到没有旧网络的地方开机，连不上 90 秒后自动进配网 | 搬家、换路由器 |
+| `A` | 文本 | 追加（实时回显） |
+| `R` | 文本 | 整体替换 |
+| `S` | `w`/`d`/`f` | 工作中 / 完成 / 失败 |
+| `T` | 4 字节小端 Unix epoch | 设置时间 |
+| `I` | 会话 ID | 换会话时清空字幕 |
 
-前两个是同一个动作：清掉已保存的 WiFi → 重启 → 进配网模式。重启后会自己把 GIF 帧缓冲还给堆（配网要用那 115KB 才发得出 DHCP 应答）。
-
-> 长按设成 3 秒而不是默认的 1.5 秒 —— 清凭据这个动作不该那么容易被误触。
-
-> 屏幕上所有提示都是**拆成短帧轮播**的，不是一整句 —— 字幕行只有 240px、字号 24px，放不下十来个字，而且是尾巴对齐的，超宽只会从左边把开头裁掉（写成一整句时，屏幕最后只剩个光秃秃的 `http://192.168.4.1`）。见 `showHint()` / `cycleHint()`。
-
-> 配网页面本身也存在 LittleFS 里（`data/wifi_configuration*.html`），改完要跑 `pio run -t uploadfs` 才生效。
-
-> **想换到「本机自己开的热点」上时可能撞上死循环**：要访问 `192.168.4.1` 得让无线去连设备热点，可时钟又必须在提交那一刻热点已经开着。成不成，取决于**热点把哪条线路共享出去**：
->
-> - 热点共享的是**无线**（没插网线时的必然情况）→ Windows 把 STA 钉在上游那条链路上，无线连不了别的 AP → **死循环**
-> - 热点共享的是**有线**（或任何非无线）→ 无线完全自由，能同时连设备热点 → 走门户就行
->
-> 判断方法：热点设置里看「共享网络连接」指向谁。真撞上死循环时别走门户，直接写 NVS：造一份 `ssid`/`password` 的 CSV，用 IDF 的 `nvs_partition_gen.py` 生成镜像，刷到 `0x9000`（分区表里 nvs 区，大小 `0x6000`）。凭据格式见 `lib/esp-wifi-connect/ssid_manager.cc`（命名空间 `wifi`）。清凭据回配网模式：`esptool erase_region 0x9000 0x6000`。
+长文本分块发送，每块都带前缀；MTU 协商到 247 时每块约 200 字节。
 
 ## 换 GIF
 
@@ -143,26 +155,11 @@ static const Reminder kReminders[] = {
 
 ## Claude 状态回显（可选）
 
-屏幕顶部那行可以实时显示 Claude Code 正在输出的内容，并用颜色表示状态：
-
-| 颜色 | 含义 |
-|---|---|
-| 琥珀 | Claude 正在回答 |
-| 绿色 | 回答完成 |
-| 红色 | 出错中断 |
-| 灰色 | 还没收到过输出 |
-
-显示方式是**尾巴对齐** —— 最新文字永远贴在右边缘，旧文字被顶出左侧。这里刻意不用
-匀速跑马灯：Claude 的生成速度是每秒几十字，而可读的滚动速度只有约 6 字/秒，匀速滚
-必然越积越滞后。
-
-原理是 Claude Code 的 `MessageDisplay` 钩子在回答流式输出时**逐批**触发，一个 Python
-脚本把新增文字 POST 给时钟。`Stop` 时再用完整文本兜底替换一次并标记完成。
+原理是 Claude Code 的 `MessageDisplay` 钩子在回答流式输出时**逐批**触发，脚本把新增文字发给守护进程，后者经 BLE 送到时钟。`Stop` 时再用完整文本兜底替换一次并标记完成。
 
 ### 启用步骤
 
-**1. 拿到时钟的 IP。** 设备配好网后，**屏幕顶部会轮播「本机IP」和它拿到的 IP**，记下来。
-（没看到就断电重开，或者去路由器后台按主机名 `esp32-clock` 查。）
+**1. 让守护进程跑起来**（见上节）。
 
 **2. 建 hook 配置。** 模板在 `tools/claude-hooks.example.json`，两种装法：
 
@@ -172,9 +169,7 @@ static const Reminder kReminders[] = {
 cp tools/claude-hooks.example.json .claude/settings.local.json
 ```
 
-**在任意项目都生效**（时钟放桌上时更实用 —— 你在别的仓库干活它也照样显示）。
-把整段 `hooks` 合并进 `~/.claude/settings.json`，并把脚本路径改成**绝对路径**
-（全局配置里 `${CLAUDE_PROJECT_DIR}` 会展开成当前项目，不是这个项目）：
+**在任意项目都生效**（时钟放桌上时更实用）。把整段 `hooks` 合并进 `~/.claude/settings.json`，并把脚本路径改成**绝对路径**（全局配置里 `${CLAUDE_PROJECT_DIR}` 会展开成当前项目，不是这个项目）：
 
 ```json
 { "hooks": { "MessageDisplay": [
@@ -184,104 +179,48 @@ cp tools/claude-hooks.example.json .claude/settings.local.json
 
 > **两种装法只能选一个。** 同时配会让每轮推送两次。
 
-> 项目级文件被 `.gitignore` 排除，不会随仓库分发 —— 别人克隆后不会平白多出一个
-> 指向不存在设备的本地服务。要启用就得显式装一次。
-
-**3. 填时钟地址**（第 1 步里记下的 IP），设环境变量：
-
-```bash
-CLAUDE_CLOCK_URL=http://192.168.1.77
-```
-
-**4. 重启 Claude Code 会话** —— hook 配置在会话启动时加载，改完当前会话不生效。
+**3. 重启 Claude Code 会话** —— hook 配置在会话启动时加载。
 
 ### 手动测试
 
-不用等 Claude，直接 curl 就能验证链路（把 IP 换成时钟实际地址）：
+不用等 Claude，直接往守护进程发命令就能验证链路：
 
 ```bash
-curl -X POST -d '测试文字' http://192.168.1.77/say      # 整体替换
-curl -X POST -d '追加的文字' http://192.168.1.77/append  # 追加（实时回显用）
-curl -X POST -d working   http://192.168.1.77/state     # 状态：working/done/failed
+echo "R测试文字" | python -c "import socket,sys;s=socket.create_connection(('127.0.0.1',8765));s.sendall(sys.stdin.buffer.read());print(s.recv(64))"
 ```
-
-### 注意
-
-- `MessageDisplay` 是**同步**钩子，Claude 会等它返回，所以脚本的超时设得很短（0.6 秒）。
-  **不要把它改成 `async: true`** —— 异步会让批次乱序到达，字幕就乱了。
-- 脚本带 30 秒熔断：时钟不在线时自动跳过，不会每次都等超时拖慢对话。
-- 时钟不在线时不会有任何提示，静默忽略。这是设计如此 —— 它不该干扰正常使用。
 
 ## 测试
 
-`tests/` 里是**打真机**的 E2E 测试 —— 设备得先连上网、PC 能访问到它，地址从
-`CLAUDE_CLOCK_URL` 取（和 hook 同一个变量），没设就整体跳过。
+`tests/` 里是**打真机**的 E2E 测试。
 
 ```bash
 pip install -r tests/requirements.txt
-set CLAUDE_CLOCK_URL=http://192.168.137.12
 set ESSPORT=COM5
 pytest -v
 ```
 
-串口号也可以在 `pytest.ini` 里固定；不给的话 pytest-embedded 会自己探测。
+| 文件 | 打什么 |
+|---|---|
+| `test_boot.py` | 复位真机，断言启动走到蓝牙开始广播（官方 pytest-embedded 的 `dut` 夹具） |
+| `test_ble.py` | 通过守护进程发指令，读回设备状态断言（文本、状态、会话、时间） |
 
-三层：
+守护进程没跑或设备不可达时整体跳过，不会红一片。
 
-| 文件 | 打什么 | 层 |
-|---|---|---|
-| `test_boot.py` | 复位真机，断言启动走到联网对时（官方 pytest-embedded 的 `dut` 夹具） | 串口 |
-| `test_http.py` | `/say` `/append` `/state` 的**行为**，不只是状态码；外加堆余量下限 | HTTP |
-| `test_provision.py` | 配网全流程：擦凭据 → 进配网 → 客户端拿 DHCP → 堆余量 → 提示不超宽 | 串口+HTTP |
+> 串口断言只能用 **ASCII**：pexpect 的 encoding 默认是 None，中文模式会被按 ASCII 编码直接抛 `UnicodeEncodeError`。好在关键日志都有 ASCII 部分（`lcd ready`、`advertise`）。
 
-**堆余量是被专门盯住的一项**，因为「设备发不出 DHCP 应答、客户端卡在获取 IP」那个 bug 的根因就是内存（见「已知限制」）。与其等有人拿手机去连、发现卡住，不如直接守数字：
-
-| 模式 | 最大连续块（实测基线） | 测试下限 |
-|---|---|---|
-| 配网（帧缓冲已释放） | **58.0 KB** | 40 KB |
-| 联网（帧缓冲按设计常驻） | **7.5 KB** | 4 KB |
-
-配网那条最关键 —— 它守的是设备给别人发 DHCP 的那条路径。`/debug/ticker` 里带了
-`free_heap` / `largest_block` / `largest_block_dma`，配网模式下 HTTP 服务还没起，
-所以固件另外在 `gifFreeFramebuffer()` 里打一行 `heap-after-free free=.. largest=.. dma_largest=..`
-供串口断言。
-
-**往后往常驻内存里塞大块东西，这两条会先红** —— 不用等到现象复现。
-
-**`test_provision.py` 默认不跑**，它有副作用（擦设备凭据、切 PC 网卡），要显式开：
-
-```bash
-set CLOCK_E2E_PROVISION=1
-pytest tests/test_provision.py -v
-```
-
-它会先把 nvs 分区备份出来、测完写回，所以设备的 WiFi 凭据不会丢。
-
-测试要临时把 PC 的无线挂到设备配网热点上。**按结果区分两种情况**（`_connect_device_ap`）：
-
-- **关联不上** → 前置条件不满足（移动热点多半在共享无线，Windows 会把 STA 钉在上游链路上）→ **跳过**
-- **关联上了却拿不到 `192.168.4.x`** → 正是设备发不出 DHCP 应答的病征 → **失败**
-
-这个区分很重要：混在一起的话，真出现 DHCP bug 会被当成「环境问题」跳过去，等于把 bug 藏起来。
-
-> 串口断言只能用 **ASCII**：pexpect 的 encoding 默认是 None，中文模式会被按 ASCII
-> 编码直接抛 `UnicodeEncodeError`。好在每条关键日志都有 ASCII 部分（`lcd ready`、
-> `wifi up, ssid=`、`time synced:`）。固件里那条提示超宽的告警也因此带了
-> `hint-frame-clipped` 前缀，给测试做机器可读标记。
-
-**测不到的**：屏幕像素。渲染回归（「3 数字有丝线」那类）目前只能靠肉眼，
-要进一步得让 `drawTicker` 能把 sprite dump 成 PPM 通过 HTTP 取回。
+**测不到的**：屏幕像素。渲染回归（「3 数字有丝线」那类）目前只能靠肉眼。
 
 ## 已知限制
 
 - **提醒文字只能用 efontCN_24 覆盖到的汉字**，且字形固定、不可缩放。用了字库外的生僻字会显示空白。
 - **中文点阵字库占 554KB flash**，所以分区表用了自定义的 `partitions.csv`（app 区 2MB），默认分区表 1MB 装不下。
-- **GIF 播放需要 115KB 帧缓冲**，且必须 DMA 可访问 —— 实测堆里凑不出连续的 115200 字节，所以拆成了上下两块各 57600 字节。**配网模式下会主动把它还给堆**，见下条。
-- **配网时 lwIP 发不出 DHCP 应答（会让客户端卡在「获取 IP 地址」）**，根因是内存不够：开机可用堆只有 107KB 左右，而 115KB 的 GIF 帧缓冲一开机就常驻、配网时毫无用处，lwIP 发 ACK 时分配不到内存就返回 `-1 (ERR_MEM)`，客户端永远等不到应答。修法是进配网前先 `gifFreeFramebuffer()`，按 BOOT 键播放时再自动分配。另外 `sdkconfig.defaults` 里关掉了 `CONFIG_LWIP_DHCPS_STATIC_ENTRIES`（让 DHCP 服务器一律广播，不依赖 ARP 表）。诊断这段需要把 IDF 源码 `components/lwip/apps/dhcpserver/dhcpserver.c` 里的 `DHCPS_DEBUG` 改成 1 重编 —— 注意它**不用 `ESP_LOG`**，默认构建下 60 条调试输出全是死的。
+- **GIF 播放需要 115KB 帧缓冲**，且必须 DMA 可访问 —— 实测堆里凑不出连续的 115200 字节，所以拆成了上下两块各 57600 字节。
 - GIF 画面与时钟不能同时显示，播放期间时钟暂停刷新。
-- **配网页面不支持设静态 IP**（esp-wifi-connect 的 Advanced 页只有 OTA 地址、发射功率、记住 BSSID 三项），所以设备走 DHCP。`sdkconfig.defaults` 里开了 `CONFIG_LWIP_DHCP_RESTORE_LAST_IP`：客户端把上次的地址存进 nvs，重连时主动要回同一个，要不到才退回正常 DHCP。**实测设备重启地址不变，但重启热点/路由器仍可能换**（ICS 的租约表一重置就重新分配，实测 .12 → .66 → .174）—— 换网络也照常能用。没去写死静态 IP，那会让设备一到别的网络就联不上。
+- **时间依赖 PC**：蓝牙不通互联网。PC 关机时靠内部 RTC 走，几小时会漂几秒到几十秒，重连后自动校正。
+- **蓝牙范围约 10 米**，隔墙会明显缩水。时钟和 PC 最好在同一房间。
+- **PC 必须开着蓝牙**。适配器存在但无线电关着时，守护进程会连不上（`Bluetooth radio is not powered on`）。
 
 ## 参考资料
 
-- [espressif/esp-idf#12580](https://github.com/espressif/esp-idf/issues/12580) —— 软 AP 的 DHCP 服务器因 UDP 广播丢失而出问题。本项目「客户端卡在获取 IP 地址」那个坑的官方记录（我们的根因是内存，不完全相同，但同一段代码）。
+- [espressif/esp-idf#12580](https://github.com/espressif/esp-idf/issues/12580) —— 早期 WiFi 版本踩过的软 AP DHCP 缺陷记录。现在这条路径已经整个删掉了，留作背景。
 - 引脚与面板参数**均为本机实测**，不是照抄现成配置 —— 见「硬件接线」开头那条警告。
