@@ -123,6 +123,9 @@ Win+R → shell:startup → 在里面新建快捷方式，目标：
 pythonw.exe "C:\git-program\esp32-clock\tools\clock-ble-daemon.py"
 ```
 
+> `pythonw.exe` 没有控制台，`print` 出去的东西谁也看不到 —— 所以守护进程同时把日志写进
+> `%TEMP%\clock-ble-daemon.log`。连不上设备时先看这个文件。
+
 ## BLE 协议
 
 服务和特征都是 128 位 UUID（`BLE_UUID128_INIT` 是小端，见 `src/ble_clock.cpp` 顶部的说明）：

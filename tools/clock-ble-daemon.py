@@ -26,8 +26,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import os
 import sys
+import tempfile
 import time
 
 from bleak import BleakClient, BleakScanner
@@ -48,9 +49,22 @@ TIME_PUSH_SECONDS = 300
 
 RECONNECT_DELAY = 3.0
 
+# 日志同时写文件：开机自启用 pythonw.exe 启动时没有控制台，print 出去的东西
+# 谁也看不到，出问题就只能靠这个文件。
+LOG_PATH = os.path.join(tempfile.gettempdir(), "clock-ble-daemon.log")
+
 
 def log(msg: str) -> None:
-    print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
+    line = f"{time.strftime('%H:%M:%S')} {msg}"
+    try:
+        print(line, flush=True)
+    except Exception:  # noqa: BLE001 —— pythonw 下没有 stdout
+        pass
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 class ClockLink:
