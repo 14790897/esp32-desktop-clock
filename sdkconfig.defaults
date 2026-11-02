@@ -1,29 +1,25 @@
-# 给 ESP-IDF/PlatformIO 生成 sdkconfig 用的默认值。改这里才会进版本库，
-# sdkconfig.esp32c3-clock 是生成物、已被 .gitignore 排除。
+# 这个固件**只用蓝牙**：WiFi 关掉，省 flash 和 RAM。
+# 蓝牙上不了互联网，所以时间由 PC 通过 BLE 推送（见 src/main.cpp 的 bleOnTime）。
+#
+# lwIP 不能关：esp-tls 等组件依赖它的 sys/socket.h，关掉会编译失败。
+# 没有 netif 在用，它基本只是躺在那儿。
+#
+# 改这里才会进版本库；sdkconfig.esp32c3-clock 是生成物、已被 .gitignore 排除。
 
-# 关掉 DHCP 服务器的「静态 ARP 记录」模式。
-#
-# 打开时（IDF 默认）DHCP 服务器会给客户端单播发 OFFER/ACK，为此要临时往
-# ARP 表塞一条静态记录。实测这条链会失败：
-#
-#   手机不置广播位 → 服务器决定单播 → etharp_add_static_entry() 加记录
-#   （返回值被丢弃）→ ARP 表满时加不进去 → udp_sendto 找不到 ARP 记录
-#   直接返回 -1 (ERR_MEM) → ACK 发不出去 → 手机永远卡在「获取 IP 地址」
-#
-# 实测日志（把 IDF 里 DHCPS_DEBUG 打开后）：
-#   dhcps: send_offer>>udp_sendto result 0        ← OFFER 成功
-#   dhcps: send_ack>>udp_sendto result ffffffff   ← ACK 失败，重试两次才成
-#
-# 而 ARP 记录会泄漏：客户端开始正常通信后该条目会变成动态条目，
-# etharp_remove_static_entry() 便删不掉它（返回 ERR_ARG），反复配网就把表撑满。
-#
-# 关掉之后 DHCP 服务器一律广播 OFFER/ACK，不依赖 ARP，绕开整条失败链。
-CONFIG_LWIP_DHCPS_STATIC_ENTRIES=n
+# CONFIG_ESP_WIFI_ENABLED is not set
 
-# 让 DHCP 客户端记住上次拿到的地址，重启/重连时主动要回同一个。
-#
-# 为什么不用静态 IP：写死地址会让设备换到别的网络就连不上，而「别人克隆下来
-# 开箱就能配网」是这个项目的核心目标（配网门户就是为它做的）。这个选项两头都占：
-# 地址空着就复用（CLAUDE_CLOCK_URL 因此稳定），被别人占了就自动退回正常 DHCP
-# （换网络照常能用）。上次的有效配置存在 nvs 里。
-CONFIG_LWIP_DHCP_RESTORE_LAST_IP=y
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+
+# 只作外设（peripheral + broadcaster）：时钟等 PC 连上来推数据，不主动扫别人。
+# 关掉 central/observer 能省一些 RAM。
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+# CONFIG_BT_NIMBLE_ROLE_CENTRAL is not set
+# CONFIG_BT_NIMBLE_ROLE_OBSERVER is not set
+
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+
+# 247 是 Windows 上常见的协商值。越大，PC 发一段文字要分的块越少。
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096

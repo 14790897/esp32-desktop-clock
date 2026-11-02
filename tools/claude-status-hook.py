@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""把 Claude Code 的输出实时回显到桌面时钟上。
+"""把 Claude Code 的输出实时回显到桌面时钟上（走蓝牙）。
 
 作为 Claude Code 的 hook 使用，两个事件：
 
@@ -12,34 +12,34 @@
 「已完成」（绿）。因此**不需要** UserPromptSubmit 之类的开工信号 —— 那个 hook 只能
 异步跑，可能比第一批文字到得还晚，反而会把颜色卡在上一轮的状态上。
 
-设计约束：
-- MessageDisplay 是**同步**的 —— Claude 会等钩子返回，所以超时必须短。
-  用 async 反而会让批次乱序到达，字幕就乱了。
-- 这台机器没有 jq，用 Python 解析 JSON 最省事。
-- 时钟可能不在线（关机 / 换网络），失败是常态，不能因此拖慢对话。
+**为什么不是直接连蓝牙**：MessageDisplay 是同步钩子，Claude 会等它返回，超时预算
+只有 0.6 秒；而 BLE 建连要一两秒。所以这里只往本机 socket 写一行，真正的 BLE
+连接由常驻的 tools/clock-ble-daemon.py 维护。
+
+    本 hook ──> 127.0.0.1:8765 ──> 守护进程 ──BLE──> 时钟
+
+守护进程没跑时连接会立刻失败，这时按熔断逻辑跳过，不拖慢对话。
 """
 
 import json
 import os
+import socket
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 
-# 时钟地址。必须用环境变量指定 —— 设备走 DHCP，地址会变，写死一个默认值只会
-# 让 hook 静默地连到一台不存在的机器上。屏幕配网后会在顶部显示 10 秒实际 IP。
-#     CLAUDE_CLOCK_URL=http://192.168.1.77
-DEVICE = os.environ.get("CLAUDE_CLOCK_URL", "").rstrip("/")
+# 守护进程的本机地址。端口要和 tools/clock-ble-daemon.py 一致。
+HOST = os.environ.get("CLAUDE_CLOCK_HOST", "127.0.0.1")
+PORT = int(os.environ.get("CLAUDE_CLOCK_PORT", "8765"))
 
-# 兜底替换时的文字上限（字符数）。设备端的显示缓冲只有 1KB，
-# 而且屏幕是尾巴对齐的，多送的部分根本显示不出来。
-MAX_CHARS = 400
+# 兜底替换时的文字上限（字符数）。设备端的显示缓冲只有 1024 字节，
+# 而一个汉字占 3 字节 —— 留出余量，别让尾部被截掉。
+MAX_CHARS = 300
 
 # 超时必须短：MessageDisplay 在关键路径上，Claude 会等它返回
 TIMEOUT = 0.6
 
-# 熔断：设备不在线时不要每批都等超时，否则整段输出会被拖慢。
+# 熔断：守护进程/时钟不在线时不要每批都等超时，否则整段输出会被拖慢。
 # 文件 mtime 就是上次失败时刻。
 FAIL_MARK = os.path.join(tempfile.gettempdir(), "claude-clock-offline")
 FAIL_COOLDOWN = 30
@@ -52,28 +52,30 @@ def clock_offline() -> bool:
         return False
 
 
-def post(path: str, body: str) -> None:
-    """发一个请求。失败时记下时间触发熔断，不抛异常给调用方。"""
+def mark(offline: bool) -> None:
+    try:
+        if offline:
+            open(FAIL_MARK, "w").close()
+        else:
+            os.remove(FAIL_MARK)
+    except OSError:
+        pass
+
+
+def send(*lines: str) -> None:
+    """把若干条命令发给守护进程。失败时记下时间触发熔断，不抛异常给调用方。
+
+    每条命令一行，前缀一个字符，见守护进程的协议说明。
+    """
     if clock_offline():
         return
     try:
-        req = urllib.request.Request(
-            DEVICE + path,
-            data=body.encode("utf-8"),
-            method="POST",
-            headers={"Content-Type": "text/plain; charset=utf-8"},
-        )
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            resp.read()
-        try:
-            os.remove(FAIL_MARK)  # 通了就把熔断解除
-        except OSError:
-            pass
-    except (urllib.error.URLError, OSError, TimeoutError):
-        try:
-            open(FAIL_MARK, "w").close()
-        except OSError:
-            pass
+        with socket.create_connection((HOST, PORT), timeout=TIMEOUT) as sock:
+            sock.sendall(("\n".join(lines) + "\n").encode("utf-8"))
+            sock.recv(64)  # 等一个 ok，确认真的送到了
+        mark(offline=False)
+    except OSError:
+        mark(offline=True)
 
 
 def flatten(text: str) -> str:
@@ -89,15 +91,6 @@ def tail(text: str, limit: int) -> str:
 
 
 def main() -> None:
-    if not DEVICE:
-        print(
-            "claude-status-hook: 未设置 CLAUDE_CLOCK_URL，时钟回显已跳过。"
-            "设备配网后屏幕顶部会显示 10 秒实际 IP，"
-            "把它设成 CLAUDE_CLOCK_URL=http://<IP> 即可。",
-            file=sys.stderr,
-        )
-        return
-
     try:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -105,28 +98,33 @@ def main() -> None:
 
     event = payload.get("hook_event_name", "")
 
-    # 带上会话标识。多开会话时它们都往同一个字幕推，设备靠这个区分：
+    # 会话标识。多开会话时它们都往同一个字幕推，设备靠这个区分：
     # 换了会话就清空重来，否则两个会话的输出会接成一句读不通的话。
+    # 每条消息都带上，钩子就不用自己记状态。
     sid = payload.get("session_id") or ""
-    q = f"?sid={sid}" if sid else ""
+
+    # 每条命令前都带上会话标识（空则省略）。钩子不记状态，设备自己判断变没变。
+    prefix = [f"I{sid}"] if sid else []
 
     if event == "MessageDisplay":
         # 逐批追加，不截断 —— 设备端自己会丢掉超出缓冲的老内容。
         # 设备收到文字就认为「正在工作」，所以不需要单独的开工信号。
         delta = flatten(payload.get("delta") or "")
         if delta:
-            post("/append" + q, delta)
+            send(*prefix, "A" + delta)
 
     elif event == "Stop":
         # 流式过程中已经追加过了，这里用完整文本兜底替换一次，
         # 保证最终内容完整（万一有批次丢了）
         text = flatten(payload.get("last_assistant_message") or "")
+        lines = list(prefix)
         if text:
-            post("/say" + q, tail(text, MAX_CHARS))
-        post("/state" + q, "done")
+            lines.append("R" + tail(text, MAX_CHARS))
+        lines.append("Sd")
+        send(*lines)
 
     elif event == "StopFailure":
-        post("/state" + q, "failed")
+        send(*prefix, "Sf")
 
 
 if __name__ == "__main__":

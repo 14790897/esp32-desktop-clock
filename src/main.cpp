@@ -1,36 +1,27 @@
 #include <LovyanGFX.hpp>
 
 #include "driver/gpio.h"
-#include "esp_event.h"
 #include "esp_heap_caps.h"
-#include "esp_http_server.h"
 #include "esp_littlefs.h"
 #include "esp_log.h"
-#include "esp_netif.h"
-#include "esp_netif_sntp.h"
 #include "esp_system.h"
 #include "esp_timer.h"
-#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "nvs_flash.h"
 
 #include <lgfx/Fonts/efont/lgfx_efont_cn.h>
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <sys/socket.h>
+#include <sys/time.h>
 
 #include <cstring>
 #include <ctime>
 
+#include "ble_clock.h"
 #include "button_gpio.h"
 #include "clock_config.h"
 #include "gif_player.h"
 #include "iot_button.h"
 #include "reminders.h"
-#include "ssid_manager.h"
-#include "wifi_manager.h"
 
 static const char* kTag = "clock";
 
@@ -135,20 +126,6 @@ volatile bool gTickerDirty = false;  // 有新内容，等 clockTask 重算宽�
 volatile bool gTickerActive = false;
 int gTickerTextW = 0;  // 文本总宽，内容变化时重算一次
 
-// 单行提示的轮播状态。放在这里而不是 showHint 旁边 —— /debug/ticker 要读它们，
-// 那个 handler 定义得更靠前。
-constexpr int kHintMaxFrames = 4;
-char gHintFrames[kHintMaxFrames][96] = {};
-uint16_t gHintMs[kHintMaxFrames] = {};
-int16_t gHintWidths[kHintMaxFrames] = {};  // 量好的像素宽，量的时候顺手存下来
-int gHintCount = 0;
-int gHintIndex = 0;
-uint32_t gHintAt = 0;
-
-// 「重新配网」请求。两个触发方（BOOT 长按、HTTP 端点）只置这个标志，
-// 实际动作由 clockTask 做 —— 它们各自的上下文里干重活会有并发问题。
-// 声明放这儿是因为 requestWifiReset() 定义得比按键回调早。
-volatile bool gWifiResetRequested = false;
 SemaphoreHandle_t gTickerLock = nullptr;
 
 // 行内绘制走精灵缓冲：直接往屏幕上「先清后画」会闪，而且 drawString 往屏幕
@@ -327,113 +304,17 @@ void drawReminder(const char* text, const struct tm& t) {
   lcd.drawCenterString(buf, W / 2, H / 2 + 12);
 }
 
-// ==================== 联网与对时 ====================
-enum class Net : uint8_t { Wifi, Syncing, Ready };
-
-Net netState = Net::Wifi;
-bool sntpStarted = false;
-bool httpStarted = false;
-httpd_handle_t gHttpServer = nullptr;
-bool apHintShown = false;  // 配网提示只在进入配网模式时推一次
-
-// 有凭据但连不上多久后改入配网模式。留足时间给路由器重启之类的短暂故障，
-// 又不至于让换了网络的人一直干等。
-constexpr uint32_t kConfigApFallbackMs = 90000;
+// ==================== 状态与字幕 ====================
 
 uint32_t nowMs() { return static_cast<uint32_t>(esp_timer_get_time() / 1000ULL); }
 
-// NTP 成功前系统时间是 1970，用这个阈值区分
+// 时间还没被 PC 通过 BLE 推过来时，系统时间是 1970，用这个阈值区分
 bool timeIsValid() { return time(nullptr) > 1600000000; }
 
-// WiFi 交给 78/esp-wifi-connect 组件的 WifiManager：凭据存在 NVS 里，连不上就
-// 自己开热点 + 起配置网页（默认中文界面），不再需要 secrets.h 写死账号密码。
-//
-// 代价是没有静态 IP —— 组件不支持（高级页只有 OTA 地址、发射功率、记住 BSSID），
-// 所以走 DHCP。连上后把 IP 显示在屏幕上，供设置 hook 的 CLAUDE_CLOCK_URL 用。
-void initWifi() {
-  WifiManagerConfig cfg;
-  cfg.ssid_prefix = WIFI_AP_PREFIX;      // 配网热点名形如 esp32-clock-A1B2
-  cfg.language = "zh-CN";
-  cfg.station_hostname = WIFI_HOSTNAME;  // 向路由器注册的主机名，部分路由器可据此解析
+// 当前会话标识。BLE 用 'I' 指令设置它，之后收到的文本都归这个会话。
+char gBleSession[48] = {};
 
-  WifiManager& wifi = WifiManager::GetInstance();
-  if (!wifi.Initialize(cfg)) {
-    ESP_LOGE(kTag, "WiFi 初始化失败");
-    return;
-  }
-
-  // 没有任何已保存的凭据就直接进配网模式。
-  // 注意组件**不会**在连接失败后自动切到配网 —— 实测它只会一直重试扫描（10s/20s 退避），
-  // 所以这个判断必须由应用自己做，组件 README 里也是这么示范的。
-  if (SsidManager::GetInstance().GetSsidList().empty()) {
-    ESP_LOGI(kTag, "没有已保存的 WiFi，进入配网模式");
-    // 115KB 的 GIF 帧缓冲先还给堆：配网时用不到它，而堆被占着时 lwIP
-    // 发 DHCP ACK 会分配不到内存（udp_sendto 返回 -1），客户端就卡在
-    // 「获取 IP 地址」。按 BOOT 键播放时会自动重新分配。
-    gifFreeFramebuffer();
-    wifi.StartConfigAp();
-  } else {
-    wifi.StartStation();
-  }
-}
-
-// ==================== HTTP 服务：接收 Claude 的输出 ====================
-// 只在局域网监听：
-//   POST /say           body 是文本，整体替换（手动测试、一次性推送用）
-//   POST /append        body 是新增文本，追加到末尾（实时回显用）
-//   POST /state         body 为 "working" / "done" / "failed"，只决定字幕颜色
-//   POST /wifi/reset    清掉已保存的 WiFi 并重启进配网模式
-//   GET  /debug/ticker  只读诊断快照，给 tests/ 用
-// PC 端由 Claude Code 的 hook 调用，见 tools/claude-status-hook.py
-
-// 把请求 body 读进 buf，返回实际字节数。超出 cap-1 的部分读掉丢弃 ——
-// 不排空会破坏 HTTP 连接状态，让同一连接上的后续请求失败。
-int readBody(httpd_req_t* req, char* buf, int cap) {
-  int total = 0;
-  int remaining = req->content_len;
-
-  while (remaining > 0) {
-    const int room = cap - 1 - total;
-    if (room <= 0) {
-      char sink[128];
-      const int want = remaining < static_cast<int>(sizeof(sink)) ? remaining
-                                                                 : static_cast<int>(sizeof(sink));
-      const int n = httpd_req_recv(req, sink, want);
-      if (n <= 0) {
-        if (n != HTTPD_SOCK_ERR_TIMEOUT) break;
-        continue;
-      }
-      remaining -= n;
-      continue;
-    }
-
-    const int want = remaining < room ? remaining : room;
-    const int n = httpd_req_recv(req, buf + total, want);
-    if (n <= 0) {
-      if (n != HTTPD_SOCK_ERR_TIMEOUT) break;  // 收完或出错
-      continue;                                 // 超时则继续等
-    }
-    total += n;
-    remaining -= n;
-  }
-  buf[total] = '\0';
-
-  // 截断可能正好切在汉字中间，退回到最后一个完整字符，否则屏幕上会多出乱码
-  int cut = total;
-  while (cut > 0 && (static_cast<unsigned char>(buf[cut - 1]) & 0xC0) == 0x80) --cut;
-  if (cut > 0) {
-    const unsigned char lead = static_cast<unsigned char>(buf[cut - 1]);
-    int need = 0;
-    if ((lead & 0x80) == 0x00) need = 1;
-    else if ((lead & 0xE0) == 0xC0) need = 2;
-    else if ((lead & 0xF0) == 0xE0) need = 3;
-    else if ((lead & 0xF8) == 0xF0) need = 4;
-    if (need == 0 || total - (cut - 1) < need) total = cut - 1;
-  }
-  return total;
-}
-
-// 换了会话就把缓冲清掉。多开会话时它们都往同一个字幕推，不清的话
+// 换了会话就把缓冲清掉。多开会话时它们都往同一行推，不清的话
 // A 的输出会接上 B 的输出，屏幕上是一串拼接起来的话。调用方须已持锁。
 void switchSessionIfNeeded(const char* sid) {
   if (sid == nullptr || sid[0] == '\0') return;
@@ -472,98 +353,51 @@ void appendTickerText(const char* sid, const char* s, int len) {
   memcpy(gTickerText + cur, s, len);
   gTickerText[cur + len] = '\0';
   // 有文字流进来就说明这个会话正在工作 —— 状态由数据流推导，
-  // 不依赖单独的「开始工作」信号。那个信号走的是异步 hook，可能比第一批
-  // 文字到得还晚，结果就是工作中却显示着上一轮的「已完成」绿色。
+  // 不依赖单独的「开始工作」信号，否则工作中会显示着上一轮的绿色。
   gClaudeState = ClaudeState::Working;
   gTickerDirty = true;
   xSemaphoreGive(gTickerLock);
 }
 
-// 取 URL 里的 sid 查询参数（?sid=xxx）。没有就返回空串。
-void querySession(httpd_req_t* req, char* out, size_t outLen) {
-  out[0] = '\0';
-  char q[128];
-  if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK) return;
-  if (httpd_query_key_value(q, "sid", out, outLen) != ESP_OK) out[0] = '\0';
-}
+// ==================== BLE 命令回调 ====================
 
-esp_err_t handleSay(httpd_req_t* req) {
-  char buf[kTickerCap];
-  char sid[sizeof(gTickerSession)];
-  querySession(req, sid, sizeof(sid));
-  replaceTickerText(sid, buf, readBody(req, buf, sizeof(buf)));
-  httpd_resp_sendstr(req, "ok");
-  return ESP_OK;
-}
+void bleOnAppend(const char* s, int len) { appendTickerText(gBleSession, s, len); }
 
-esp_err_t handleAppend(httpd_req_t* req) {
-  char buf[kTickerCap];
-  char sid[sizeof(gTickerSession)];
-  querySession(req, sid, sizeof(sid));
-  appendTickerText(sid, buf, readBody(req, buf, sizeof(buf)));
-  httpd_resp_sendstr(req, "ok");
-  return ESP_OK;
-}
+void bleOnReplace(const char* s, int len) { replaceTickerText(gBleSession, s, len); }
 
-esp_err_t handleState(httpd_req_t* req) {
-  char buf[16] = {};
-  const int n = httpd_req_recv(req, buf, sizeof(buf) - 1);
-  if (n <= 0) {
-    httpd_resp_sendstr(req, "ok");
-    return ESP_OK;
+void bleOnSession(const char* sid, int len) {
+  if (len <= 0) {
+    gBleSession[0] = '\0';
+    return;
   }
-  buf[n] = '\0';
+  if (len > static_cast<int>(sizeof(gBleSession)) - 1) len = sizeof(gBleSession) - 1;
+  memcpy(gBleSession, sid, len);
+  gBleSession[len] = '\0';
+}
 
-  ClaudeState st = ClaudeState::Done;  // "done" 及任何其它值都视为已完成
-  if (strncmp(buf, "working", 7) == 0) {
-    st = ClaudeState::Working;
-  } else if (strncmp(buf, "failed", 6) == 0) {
-    st = ClaudeState::Failed;
-  }
+void bleOnState(char c) {
+  ClaudeState st = ClaudeState::Done;  // 和原来的 HTTP /state 保持一致：认不出的值算完成
+  if (c == 'w') st = ClaudeState::Working;
+  else if (c == 'f') st = ClaudeState::Failed;
 
   if (xSemaphoreTake(gTickerLock, pdMS_TO_TICKS(50)) == pdTRUE) {
-    // 状态也要认会话：A 还在输出时，B 的一句「完成」不该把颜色改绿。
-    // 顺带切换当前会话 —— 新一轮开始时清掉上一条，随后流式追加的内容才干净。
-    char sid[sizeof(gTickerSession)];
-    querySession(req, sid, sizeof(sid));
-    switchSessionIfNeeded(sid);
-
     gClaudeState = st;
     // 状态只影响颜色不改文字，但同样得触发重画，否则颜色会停在旧值
     if (gTickerActive) gTickerDirty = true;
     xSemaphoreGive(gTickerLock);
   }
-
-  httpd_resp_sendstr(req, "ok");
-  return ESP_OK;
 }
 
-// 转义成 JSON 字符串内容。字幕里可能出现引号、反斜杠、控制字符
-void jsonEscape(const char* s, char* out, size_t outLen) {
-  size_t o = 0;
-  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(s); *p != '\0'; ++p) {
-    char tmp[8];
-    const char* piece = tmp;
-    switch (*p) {
-      case '"': piece = "\\\""; break;
-      case '\\': piece = "\\\\"; break;
-      case '\n': piece = "\\n"; break;
-      case '\r': piece = "\\r"; break;
-      case '\t': piece = "\\t"; break;
-      default:
-        if (*p < 0x20) {
-          snprintf(tmp, sizeof(tmp), "\\u%04x", *p);
-        } else {
-          tmp[0] = static_cast<char>(*p);
-          tmp[1] = '\0';
-        }
-    }
-    const size_t n = strlen(piece);
-    if (o + n >= outLen) break;
-    memcpy(out + o, piece, n);
-    o += n;
+void bleOnTime(uint32_t epoch) {
+  if (epoch < 1600000000UL) return;  // 明显不合理的时间不设
+  struct timeval tv = {};
+  tv.tv_sec = static_cast<time_t>(epoch);
+  tv.tv_usec = 0;
+  if (settimeofday(&tv, nullptr) == 0) {
+    ESP_LOGI(kTag, "时间已由 PC 同步: epoch=%lu", static_cast<unsigned long>(epoch));
+  } else {
+    ESP_LOGW(kTag, "settimeofday 失败");
   }
-  out[o] = '\0';
 }
 
 const char* claudeStateName(ClaudeState s) {
@@ -575,337 +409,43 @@ const char* claudeStateName(ClaudeState s) {
   }
 }
 
-// 把字幕的当前状态以 JSON 吐出来，给 tests/ 里的 E2E 用例断言用。
-// 没有这个端点，HTTP 测试就只能断言「返回 200」—— 而「提示被裁成裸 IP」
-// 「颜色状态不对」「多会话串台」这些真踩过的坑一个都测不到。
-// 重新配网：清掉已保存的 WiFi 并重启，重启后 initWifi() 会进配网模式。
-//
-// 只置标志，真正的动作交给 clockTask —— 两个触发方（BOOT 长按、HTTP 端点）
-// 在各自的上下文里跑，让它们直接干重活会有并发问题。
-void requestWifiReset() { gWifiResetRequested = true; }
-
-esp_err_t handleDebugTicker(httpd_req_t* req) {
-  // 快照必须在锁内取，否则可能读到写到一半的缓冲
+// 状态快照。BLE 的 read 响应受 MTU 限制（协商后通常 ~180 字节），所以只带
+// 字幕的**尾部** —— 屏幕本来就是尾巴对齐的，尾部才是看得见的部分。
+int bleStatus(char* buf, int cap) {
   char text[kTickerCap];
   char session[sizeof(gTickerSession)];
   int width = 0;
-  ClaudeState state = ClaudeState::Idle;
+  ClaudeState st = ClaudeState::Idle;
   bool active = false;
+  bool connected = bleClockConnected();
 
-  if (xSemaphoreTake(gTickerLock, pdMS_TO_TICKS(100)) != pdTRUE) {
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "lock busy");
-    return ESP_FAIL;
-  }
+  if (xSemaphoreTake(gTickerLock, pdMS_TO_TICKS(100)) != pdTRUE) return 0;
   snprintf(text, sizeof(text), "%s", gTickerText);
   snprintf(session, sizeof(session), "%s", gTickerSession);
   width = gTickerTextW;
-  state = gClaudeState;
+  st = gClaudeState;
   active = gTickerActive;
   xSemaphoreGive(gTickerLock);
 
-  // 转义后最大是原文两倍，全放栈上会顶爆 HTTP 任务的 4KB 栈，所以走堆
-  const size_t cap = strlen(text) * 2 + strlen(session) * 2 +
-                     static_cast<size_t>(kHintMaxFrames) * sizeof(gHintFrames[0]) * 2 + 512;
-  char* escText = static_cast<char*>(malloc(cap));
-  char* escSess = static_cast<char*>(malloc(sizeof(session) * 2));
-  char* escHint = static_cast<char*>(malloc(static_cast<size_t>(kHintMaxFrames) *
-                                            sizeof(gHintFrames[0]) * 2));
-  char* body = static_cast<char*>(malloc(cap + 384));
-  if (escText == nullptr || escSess == nullptr || escHint == nullptr || body == nullptr) {
-    free(escText); free(escSess); free(escHint); free(body);
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-    return ESP_FAIL;
+  const int fullLen = static_cast<int>(strlen(text));
+
+  // 取尾部，并且从 UTF-8 字符边界开始，别把汉字劈成半个
+  constexpr int kTailMax = 80;
+  int tailStart = fullLen > kTailMax ? fullLen - kTailMax : 0;
+  while (tailStart < fullLen && (static_cast<unsigned char>(text[tailStart]) & 0xC0) == 0x80) {
+    ++tailStart;
   }
+  const char* tail = text + tailStart;
 
-  jsonEscape(text, escText, cap);
-  jsonEscape(session, escSess, sizeof(session) * 2);
-
-  size_t o = 0;
-  o += snprintf(body + o, cap + 384 - o,
-                "{\"text\":\"%s\",\"state\":\"%s\",\"session\":\"%s\",\"active\":%s,"
-                "\"width\":%d,\"limit\":%d,"
-                // 堆余量。加这两个字段是为了让测试能在**堆被吃光之前**报警 ——
-                // 配网时 lwIP 发不出去 DHCP ACK 那个 bug 的表现是客户端卡在
-                // 「获取 IP 地址」，而根因是内存。以后再往常驻内存里塞大块东西，
-                // 测试会先在堆余量上红，不用等到有人拿手机去连。
-                "\"free_heap\":%u,\"largest_block\":%u,\"largest_block_dma\":%u,"
-                "\"hints\":[",
-                escText, claudeStateName(state), escSess, active ? "true" : "false", width,
-                W - kTickerIndent, static_cast<unsigned>(esp_get_free_heap_size()),
-                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
-                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
-
-  for (int i = 0; i < gHintCount && i < kHintMaxFrames; ++i) {
-    jsonEscape(gHintFrames[i], escHint, static_cast<size_t>(sizeof(gHintFrames[0])) * 2);
-    o += snprintf(body + o, cap + 384 - o, "%s{\"text\":\"%s\",\"width\":%d}",
-                  i == 0 ? "" : ",", escHint, gHintWidths[i]);
-  }
-  snprintf(body + o, cap + 384 - o, "]}");
-
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_sendstr(req, body);
-
-  free(escText); free(escSess); free(escHint); free(body);
-  return ESP_OK;
-}
-
-// 从局域网触发重新配网（清凭据 + 重启进配网模式）。
-// 除了方便（设备挂错网络时不用去够物理键），它的存在还有个实际原因：
-// BOOT 长按那条路没法自动化验证，而两条路走的是同一个动作。
-esp_err_t handleWifiReset(httpd_req_t* req) {
-  ESP_LOGW(kTag, "HTTP /wifi/reset：收到重新配网请求");
-  requestWifiReset();
-  httpd_resp_sendstr(req, "ok");
-  return ESP_OK;
-}
-
-bool startHttpServer() {
-  if (gTickerLock == nullptr) {
-    ESP_LOGE(kTag, "字幕锁未初始化");
-    return false;
-  }
-
-  httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-  cfg.max_uri_handlers = 6;
-  cfg.lru_purge_enable = true;  // 连接堆积时回收最久未用的，避免句柄耗尽
-
-  httpd_handle_t server = nullptr;
-  if (httpd_start(&server, &cfg) != ESP_OK) {
-    ESP_LOGE(kTag, "HTTP 服务启动失败");
-    return false;
-  }
-  gHttpServer = server;
-
-  httpd_uri_t sayUri = {};
-  sayUri.uri = "/say";
-  sayUri.method = HTTP_POST;
-  sayUri.handler = handleSay;
-  httpd_register_uri_handler(server, &sayUri);
-
-  httpd_uri_t appendUri = {};
-  appendUri.uri = "/append";
-  appendUri.method = HTTP_POST;
-  appendUri.handler = handleAppend;
-  httpd_register_uri_handler(server, &appendUri);
-
-  httpd_uri_t stateUri = {};
-  stateUri.uri = "/state";
-  stateUri.method = HTTP_POST;
-  stateUri.handler = handleState;
-  httpd_register_uri_handler(server, &stateUri);
-
-  // 只读的诊断端点，给 tests/ 用。不参与正常业务，也不改任何状态。
-  httpd_uri_t debugUri = {};
-  debugUri.uri = "/debug/ticker";
-  debugUri.method = HTTP_GET;
-  debugUri.handler = handleDebugTicker;
-  httpd_register_uri_handler(server, &debugUri);
-
-  // 重新配网（清凭据 + 重启）。和 BOOT 长按是同一个动作。
-  httpd_uri_t resetUri = {};
-  resetUri.uri = "/wifi/reset";
-  resetUri.method = HTTP_POST;
-  resetUri.handler = handleWifiReset;
-  httpd_register_uri_handler(server, &resetUri);
-
-  ESP_LOGI(kTag, "HTTP 服务已启动，等待 Claude 输出");
-  return true;
-}
-
-// 配网页也要绑 80 端口，而组件的 httpd_start 用的是 ESP_ERROR_CHECK —— 端口被占时
-// 它直接 abort 而不是返回错误。所以进配网前必须先把我们这个服务停掉。
-void stopHttpServer() {
-  if (gHttpServer == nullptr) return;
-  httpd_stop(gHttpServer);
-  gHttpServer = nullptr;
-  httpStarted = false;
-  ESP_LOGI(kTag, "HTTP 服务已停止，让出 80 端口给配网页面");
-}
-
-void startSntp() {
-  // 先自己解析一次主机名：ICS 这类网络的 DNS 代理常常是 NTP 静默失败的根因，
-  // 而 esp_netif_sntp 失败时不报错，只能靠这一步区分「DNS 挂了」和「UDP 不通」
-  struct addrinfo hints = {};
-  hints.ai_family = AF_INET;
-  hints.ai_socktype = SOCK_DGRAM;
-  struct addrinfo* res = nullptr;
-  const int rc = getaddrinfo(NTP_SERVER_1, "123", &hints, &res);
-  if (rc == 0 && res != nullptr) {
-    char ip[16] = {};
-    inet_ntoa_r(reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr, ip, sizeof(ip));
-    ESP_LOGI(kTag, "DNS ok: %s -> %s", NTP_SERVER_1, ip);
-    freeaddrinfo(res);
-  } else {
-    ESP_LOGE(kTag, "DNS failed for %s (rc=%d)", NTP_SERVER_1, rc);
-  }
-
-  // 这台设备 sdkconfig 里 CONFIG_LWIP_SNTP_MAX_SERVERS=1，只能配一个服务器
-  esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(NTP_SERVER_1);
-  cfg.start = true;
-  const esp_err_t err = esp_netif_sntp_init(&cfg);
-  if (err != ESP_OK) {
-    ESP_LOGE(kTag, "sntp init failed: %s", esp_err_to_name(err));
-  } else {
-    ESP_LOGI(kTag, "sntp started, server=%s", NTP_SERVER_1);
-  }
-  sntpStarted = true;
-  netState = Net::Syncing;
-  drawStatus(COL_WAIT, "syncing time...");
-}
-
-// ==================== 单行提示轮播 ====================
-// 字幕行只有 240px、字号 24px，放不下十来个字；而它是尾巴对齐的（见 drawTicker），
-// 超宽只会从左边裁。实测「本机 192.168.1.77」宽 276px、「连热点 A 后浏览器打开 B」
-// 更宽 —— 两种情况下屏幕上都只剩个裸 IP 或网址，最该看的那半句反而没了。
-// 整个屏幕又只有这一条消息行（下面几行是时钟和日期），所以统一拆成
-// 「标签 / 取值」交替的短帧轮播：每帧都短到放得下，连起来读正好是一句完整提示。
-
-void showHint(const char* const* texts, const uint16_t* durations, int count) {
-  if (count > kHintMaxFrames) count = kHintMaxFrames;
-  for (int i = 0; i < count; ++i) {
-    snprintf(gHintFrames[i], sizeof(gHintFrames[i]), "%s", texts[i]);
-    gHintMs[i] = durations[i];
-  }
-  gHintCount = count;
-  gHintIndex = 0;
-  gHintAt = nowMs();
-
-  // 宽度是量出来的不是猜的：WIFI_AP_PREFIX 改长、或 IP 段变长都会静默裁字。
-  // 前缀 `hint-frame-clipped` 是给测试用的机器可读标记（tests/test_provision.py），
-  // 串口断言只能用 ASCII，而后面这句是中文。
-  lcd.setFont(&fonts::efontCN_24);
-  lcd.setTextSize(1.0f);
-  for (int i = 0; i < count; ++i) {
-    const int w = lcd.textWidth(gHintFrames[i]);
-    gHintWidths[i] = static_cast<int16_t>(w);  // 存下来，HTTP 线程读它就不用碰 lcd
-    if (w > W - kTickerIndent) {
-      ESP_LOGW(kTag, "hint-frame-clipped: 提示第 %d 帧「%s」宽 %dpx，超出可显示的 %dpx，会被裁掉",
-               i, gHintFrames[i], w, W - kTickerIndent);
-    }
-  }
-
-  replaceTickerText("boot", gHintFrames[0], static_cast<int>(strlen(gHintFrames[0])));
-}
-
-void stopHint() { gHintCount = 0; }
-
-// 只在 clockTask 里调用。
-void cycleHint() {
-  if (gHintCount == 0) return;
-  if (nowMs() - gHintAt < gHintMs[gHintIndex]) return;
-
-  // 这一行已经被别人（Claude 的输出）改写了，提示就到此为止，别再抢回来
-  bool preempted = false;
-  if (xSemaphoreTake(gTickerLock, pdMS_TO_TICKS(50)) != pdTRUE) return;
-  preempted = strcmp(gTickerText, gHintFrames[gHintIndex]) != 0;
-  xSemaphoreGive(gTickerLock);
-  if (preempted) {
-    stopHint();
-    return;
-  }
-
-  gHintAt = nowMs();
-  gHintIndex = (gHintIndex + 1) % gHintCount;
-  replaceTickerText("boot", gHintFrames[gHintIndex],
-                    static_cast<int>(strlen(gHintFrames[gHintIndex])));
-}
-
-// 把设备 IP 推到字幕行显示。Claude 一有输出就会顶掉它，所以不做超时清除 ——
-// 顺带的好处是没跑 Claude 时屏幕上一直能看到本机地址。
-void showIpOnTicker(const char* ip) {
-  const char* texts[] = {"本机IP", ip};
-  const uint16_t ms[] = {2000, 4000};
-  showHint(texts, ms, 2);
-}
-
-// 配网模式时把热点名和配置网址显示出来。有屏就不必去翻串口日志。
-void showConfigPortalHint(const char* ap, const char* url) {
-  const char* texts[] = {"连热点", ap, "浏览器打开", url};
-  const uint16_t ms[] = {1500, 3000, 1500, 3000};
-  showHint(texts, ms, 4);
-}
-
-void serviceNetwork() {
-  WifiManager& wifi = WifiManager::GetInstance();
-  static uint32_t tryingSince = 0;
-
-  // ---- 配网模式：设备自己开着热点等配置 ----
-  if (wifi.IsConfigMode()) {
-    if (!apHintShown) {
-      apHintShown = true;
-      const std::string ap = wifi.GetApSsid();
-      const std::string url = wifi.GetApWebUrl();
-      ESP_LOGI(kTag, "进入配网模式：热点 %s，浏览器打开 %s", ap.c_str(), url.c_str());
-      showConfigPortalHint(ap.c_str(), url.c_str());
-    }
-    netState = Net::Wifi;
-    return;
-  }
-  apHintShown = false;
-  stopHint();
-
-  // ---- 还没连上 ----
-  if (!wifi.IsConnected()) {
-    if (netState != Net::Wifi) {
-      netState = Net::Wifi;
-      drawStatus(COL_WAIT, "wifi lost, retrying...");
-      ESP_LOGW(kTag, "wifi disconnected");
-    }
-    // 有凭据却一直连不上（换了网络、改了密码、路由器没开）：超时后自动进配网，
-    // 否则设备就再也配不了了，只能重新烧录固件
-    if (tryingSince == 0) tryingSince = nowMs();
-    if (nowMs() - tryingSince >= kConfigApFallbackMs) {
-      ESP_LOGW(kTag, "连接超时，改入配网模式");
-      tryingSince = 0;
-      stopHttpServer();
-      gifFreeFramebuffer();  // 同上：配网要那 115KB 才发得出 DHCP ACK
-      wifi.StartConfigAp();
-    }
-    return;
-  }
-  tryingSince = 0;
-
-  // ---- 刚连上：记录 IP、起服务、开始对时 ----
-  if (netState == Net::Wifi) {
-    const std::string ip = wifi.GetIpAddress();
-    ESP_LOGI(kTag, "wifi up, ssid=%s ip=%s", wifi.GetSsid().c_str(), ip.c_str());
-    showIpOnTicker(ip.c_str());
-
-    // 只在成功时置位：配网刚结束时组件的 httpd 可能还没释放 80 端口，
-    // 这一轮起不来下一轮还会再试
-    if (!httpStarted) httpStarted = startHttpServer();
-    if (!sntpStarted) startSntp();  // 掉线重连时不要重复初始化 SNTP
-
-    // 配网模式里为了给 lwIP 让内存，帧缓冲被释放了；这儿连上网了要补回来，
-    // 否则 GIF 会一直走逐段推送那条慢路，直到下次重启为止。
-    // 拿不到就算了（配网刚结束、堆还紧），gifPlay 里面还会再试一次。
-    if (gifFramebufferMissing()) {
-      if (gifInitFramebuffer()) {
-        ESP_LOGI(kTag, "联网后已把 GIF 帧缓冲补回来，播放走整屏 DMA");
-      }
-    }
-    netState = Net::Syncing;
-    return;
-  }
-
-  // ---- 等对时 ----
-  if (netState == Net::Syncing) {
-    if (timeIsValid()) {
-      netState = Net::Ready;
-      drawStatus(COL_OK, nullptr);
-      const time_t now = time(nullptr);
-      struct tm t;
-      localtime_r(&now, &t);
-      ESP_LOGI(kTag, "time synced: %04d-%02d-%02d %02d:%02d:%02d", t.tm_year + 1900,
-               t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
-    } else {
-      static uint32_t lastLog = 0;
-      if (nowMs() - lastLog >= 5000) {
-        lastLog = nowMs();
-        ESP_LOGW(kTag, "still syncing, epoch=%lld", static_cast<long long>(time(nullptr)));
-      }
-    }
-  }
+  return snprintf(buf, cap,
+                  "{\"state\":\"%s\",\"session\":\"%s\",\"active\":%s,\"connected\":%s,"
+                  "\"len\":%d,\"width\":%d,\"limit\":%d,\"free_heap\":%u,"
+                  "\"largest_block\":%u,\"tail\":\"%s\"}",
+                  claudeStateName(st), session, active ? "true" : "false",
+                  connected ? "true" : "false", fullLen, width, W - kTickerIndent,
+                  static_cast<unsigned>(esp_get_free_heap_size()),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+                  tail);
 }
 
 // ==================== 存储与按键 ====================
@@ -936,21 +476,15 @@ void initStorage() {
   gStorageReady = true;
 }
 
-// BOOT 键交给 ESP-IDF 官方按键驱动 iot_button：去抖、单击/长按/连击判定
+// BOOT 键交给 ESP-IDF 官方按键驱动 iot_button：去抖、单击/连击判定
 // 都由库负责，比自己写中断计数可靠，短按也不会漏。
-// 回调在库的任务上下文里跑，这里只置标志，实际动作交给 clockTask。
+// 回调在库的任务上下文里跑，这里只累加计数，实际动作交给 clockTask。
 volatile uint32_t gButtonClicks = 0;
-
-// 长按多久算「要重新配网」。比 Kconfig 默认的 1.5 秒长 —— 清掉凭据这个动作
-// 不该那么容易被误触，3 秒是个"故意按住"的时长。
-constexpr uint16_t kLongPressResetMs = 3000;
 
 void onButtonSingleClick(void*, void*) {
   // volatile 上的 ++ 在 C++20 已废弃，显式读改写
   gButtonClicks = gButtonClicks + 1;
 }
-
-void onButtonLongPress(void*, void*) { requestWifiReset(); }
 
 // 板子上 GPIO12/13 接着指示灯。这两脚在 ESP32-C3 上默认是内部 flash 的
 // SPIHD/SPIWP，但本板 flash 跑在 DIO 模式（启动日志 "SPI Mode : DIO"，只用
@@ -968,8 +502,8 @@ void initBoardLeds() {
 
 void initButton() {
   button_config_t cfg = {};
-  cfg.long_press_time = kLongPressResetMs;  // 长按 = 重新配网，见 onButtonLongPress
-  cfg.short_press_time = 0;                 // 0 = 用 Kconfig 默认值
+  cfg.long_press_time = 0;   // 0 = 用 Kconfig 默认值（本固件不用长按）
+  cfg.short_press_time = 0;
 
   button_gpio_config_t gpioCfg = {};
   gpioCfg.gpio_num = kBootPin;
@@ -983,9 +517,7 @@ void initButton() {
     return;
   }
   iot_button_register_cb(btn, BUTTON_SINGLE_CLICK, nullptr, onButtonSingleClick, nullptr);
-  iot_button_register_cb(btn, BUTTON_LONG_PRESS_START, nullptr, onButtonLongPress, nullptr);
-  ESP_LOGI(kTag, "BOOT 键 gpio%d 就绪（短按播放 GIF，长按 %ums 重新配网）",
-           static_cast<int>(kBootPin), kLongPressResetMs);
+  ESP_LOGI(kTag, "BOOT 键 gpio%d 就绪（短按播放 GIF）", static_cast<int>(kBootPin));
 }
 
 // ==================== 定时提醒 ====================
@@ -996,16 +528,16 @@ const char* matchReminder(const struct tm& t) {
   return nullptr;
 }
 
-// 顶部那行的统一重画入口。有 Claude 文字时画字幕并复位滚动位置（从右边重新进入），
-// 否则回退到网络状态提示。GIF 播完、提醒结束后都要走这里。
+// 顶部那行的统一重画入口。有 Claude 文字时画字幕，否则回退到状态提示 ——
+// 时间还没被 PC 推过来之前显示等待提示。GIF 播完、提醒结束后都要走这里。
 void redrawTopRow() {
   if (gTickerActive) {
     // 尾巴对齐，位置由内容宽度决定，GIF/提醒占屏后不需要复位什么，直接重画
     drawTicker();
-  } else if (netState == Net::Ready) {
+  } else if (timeIsValid()) {
     drawStatus(COL_OK, nullptr);
   } else {
-    drawStatus(COL_WAIT, "connecting wifi...");
+    drawStatus(COL_WAIT, "waiting for BLE...");
   }
 }
 
@@ -1041,28 +573,10 @@ void clockTask(void*) {
   uint32_t reminderUntil = 0;
 
   for (;;) {
-    serviceNetwork();
-    cycleHint();  // 配网提示和开机 IP 都靠它轮播
     refreshTicker();
 
-    // BOOT 长按 = 重新配网：清掉已保存的 WiFi，重启后自动进配网模式。
-    //
-    // 放在最前面而不是按键处理那块 —— 那里在 `!timeIsValid()` 之后，而配网模式
-    // 和「连上了但没有外网」这两种情况都取不到时间，放后面就永远轮不到。
-    if (gWifiResetRequested) {
-      gWifiResetRequested = false;
-      ESP_LOGW(kTag, "BOOT 长按 %ums：清除已保存的 WiFi，重启进配网模式",
-               static_cast<unsigned>(kLongPressResetMs));
-      // 重启后 initWifi() 会走配网分支并自己释放帧缓冲；这里先放一次，
-      // 免得重启前的这一小段窗口里堆是紧的
-      gifFreeFramebuffer();
-      drawStatus(COL_WAIT, "wifi reset...");
-      vTaskDelay(pdMS_TO_TICKS(800));  // 让屏幕上的提示看得见再重启
-      SsidManager::GetInstance().Clear();
-      esp_restart();
-    }
-
-    // 只要对过时就走内部 RTC，断网也继续显示
+    // 时间由 PC 通过 BLE 推过来（蓝牙上不了互联网，没有 NTP）。
+    // 还没收到时系统时间是 1970，先只跑字幕、不画时钟。
     if (!timeIsValid()) {
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
@@ -1134,13 +648,6 @@ void clockTask(void*) {
 }  // namespace
 
 extern "C" void app_main(void) {
-  // 临时诊断：手机能关联却卡在「获取 IP 地址」。
-  // 注意 ESP-IDF 的 DHCP 服务器**不用 ESP_LOG** —— 它的 60 条日志全包在
-  // `#if DHCPS_DEBUG` 里，而该宏默认为 0，release 构建下一条都不存在，
-  // 所以在这里设 esp_log_level_set("dhcps", ...) 是没用的（试过，白搭）。
-  // 真正的开关在 components/lwip/apps/dhcpserver/dhcpserver.c 里的
-  // DHCPS_DEBUG，已临时改成 1，改完要一起还原。
-
   // 不主动驱动 TFT_BL：不接该引脚屏幕也正常点亮，说明背光由硬件自行处理
   // （接 VCC 或默认导通），软件干预反而可能关掉它（实测拉高后全黑）
   ESP_LOGI(kTag, "TFT_BL=gpio%d 交由硬件处理，软件不驱动", TFT_BL);
@@ -1150,7 +657,7 @@ extern "C" void app_main(void) {
   lcd.setRotation(SCREEN_ROTATION);
   ESP_LOGI(kTag, "lcd ready, %dx%d", lcd.width(), lcd.height());
 
-  // 字幕行缓冲，在起 WiFi 之前建，堆还干净。建不起来只是没有字幕，别的功能不受影响。
+  // 字幕行缓冲，在起蓝牙之前建，堆还干净。
   //
   // setSwapBytes(true)：精灵默认字节序和屏幕一致（都是 false），但实测通过
   // pushSprite 推出去颜色会高低字节颠倒 —— 琥珀色会显示成蓝色。精灵和屏幕各自
@@ -1162,22 +669,34 @@ extern "C" void app_main(void) {
     ESP_LOGE(kTag, "字幕行缓冲创建失败，滚动字幕不可用");
   }
 
-  // 字幕锁要在这里就建好，不能等到起 HTTP 服务时 —— 配网模式下 HTTP 服务不会启动，
-  // 而配网提示要往字幕里写字；那时锁还是 NULL，xSemaphoreTake(NULL) 会直接 assert 重启
+  // 字幕锁要在这里就建好：BLE 回调可能在任意时刻往字幕里写字，
+  // 锁是 NULL 的话 xSemaphoreTake(NULL) 会直接 assert 重启
   gTickerLock = xSemaphoreCreateMutex();
   if (gTickerLock == nullptr) {
     ESP_LOGE(kTag, "创建字幕锁失败");
   }
 
-  // 先挂载文件系统再起 WiFi：littlefs 挂载要分配缓存，而 WiFi 栈启动后会
+  // 先挂载文件系统再起蓝牙：littlefs 挂载要分配缓存，而蓝牙栈启动后会
   // 吃掉大量堆内存，放在后面挂载会因分配失败而挂不上
   initStorage();
   initButton();
   initBoardLeds();
   gifInitFramebuffer();
 
-  drawStatus(COL_WAIT, "connecting wifi...");
-  initWifi();
+  BleClockCallbacks cb = {};
+  cb.append = bleOnAppend;
+  cb.replace = bleOnReplace;
+  cb.state = bleOnState;
+  cb.time = bleOnTime;
+  cb.session = bleOnSession;
+  cb.status = bleStatus;
+  bleClockSetCallbacks(cb);
+
+  drawStatus(COL_WAIT, "waiting for BLE...");
+  if (!bleClockStart()) {
+    ESP_LOGE(kTag, "蓝牙启动失败 —— 这个固件没有 WiFi 兜底，通信不会工作");
+    drawStatus(COL_FAIL, "BLE failed");
+  }
 
   // 栈开到 8K：播放 GIF 时要在本任务里跑文件 IO 和逐行解码
   xTaskCreate(clockTask, "clock", 8192, nullptr, 4, nullptr);
