@@ -30,6 +30,7 @@ import os
 import sys
 import tempfile
 import time
+import traceback
 
 from bleak import BleakClient, BleakScanner
 
@@ -63,6 +64,19 @@ def log(msg: str) -> None:
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def redirect_stderr() -> None:
+    """把 stderr 也接进日志文件。
+
+    pythonw.exe 下没有控制台、`sys.stderr` 是 None —— 未捕获异常的堆栈会直接
+    丢掉，进程死了不留任何痕迹（踩过：某天守护进程悄悄没了，日志停在「已推送
+    时间」，完全看不出原因）。
+    """
+    try:
+        sys.stderr = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
     except OSError:
         pass
 
@@ -166,7 +180,7 @@ async def serve_client(link: ClockLink, reader: asyncio.StreamReader,
                 reply = f"err {exc}".encode()
             writer.write(reply + b"\n")
             await writer.drain()
-    except (ConnectionResetError, BrokenPipeError):
+    except OSError:
         pass
     finally:
         writer.close()
@@ -197,7 +211,14 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    redirect_stderr()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
+        log("收到 Ctrl-C，退出")
         sys.exit(0)
+    except BaseException:
+        # 走到这儿说明进程要死了 —— 把堆栈留在日志里，下次能查
+        log("守护进程异常退出：")
+        traceback.print_exc()
+        raise
