@@ -116,15 +116,27 @@ python tools/clock-ble-daemon.py
 
 ### 开机自启
 
-守护进程不开机自启的话，每次重启电脑都要手动跑一次。放一个快捷方式到启动文件夹即可（不需要管理员）：
+开机自启指向的是**看门狗** `tools/clock-ble-watchdog.py`，由它来管守护进程：
 
 ```
-Win+R → shell:startup → 在里面新建快捷方式，目标：
-pythonw.exe "C:\git-program\esp32-clock\tools\clock-ble-daemon.py"
+Win+R → shell:startup → 新建快捷方式，目标：
+pythonw.exe "C:\git-program\esp32-clock\tools\clock-ble-watchdog.py"
 ```
 
-> `pythonw.exe` 没有控制台，`print` 出去的东西谁也看不到 —— 所以守护进程同时把日志写进
-> `%TEMP%\clock-ble-daemon.log`。连不上设备时先看这个文件。
+看门狗每 10 秒查一次，两个条件都算异常、都会重启守护进程：
+
+- 子进程退出了
+- 子进程活着但 `127.0.0.1:8765` 没人监听（卡死）
+
+> 加它是有原因的：守护进程曾经在没有任何征兆的情况下退出过，而 `pythonw.exe`
+> 下 `sys.stderr` 是 `None`，异常堆栈直接丢掉，日志停在「已推送时间」看不出任何
+> 东西 —— 只能靠人发现「钟不走了」。现在两层都会把异常写进
+> `%TEMP%\clock-ble-daemon.log`（看门狗的行带 `[watchdog]` 前缀）。
+>
+> 实测自愈：杀掉守护进程后约 20 秒内被重新拉起并连上设备。
+>
+> 代价：常驻约 60MB（4 个进程 —— venv 的 `pythonw.exe` 是重定向器，每层会再
+> spawn 一个真实解释器）。
 
 ## BLE 协议
 
