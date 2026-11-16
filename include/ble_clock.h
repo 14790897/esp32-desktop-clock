@@ -24,6 +24,8 @@ struct BleClockCallbacks {
   void (*time)(uint32_t epoch);
   // 会话标识。换了会话字幕要清空重来。
   void (*session)(const char* sid, int len);
+  // 显示风格：'0' 经典 / '1' 像素
+  void (*style)(char c);
   // 把状态快照写成 JSON 放进 buf，返回写入长度；<=0 表示失败。
   int (*status)(char* buf, int cap);
 };

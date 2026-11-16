@@ -15,6 +15,7 @@
     R<text>   整体替换
     S<w|d|f>  状态：工作中/完成/失败
     I<sid>    会话标识（换了会话设备会清空字幕）
+    M<0|1>    显示风格：0 经典 / 1 像素
     T<epoch>  设置时间
     Q         查询，返回一行状态 JSON
 回复：`ok` 或 `err <原因>`（Q 例外，直接回状态 JSON）。
@@ -155,6 +156,10 @@ class ClockLink:
             await self.send(b"S" + body[:1])
         elif op == b"I":
             await self.send(b"I" + body)
+        elif op == b"M":
+            if not body:
+                return b"err no style"
+            await self.send(b"M" + body[:1])
         elif op == b"T":
             await self.push_time()
         elif op == b"Q":

@@ -80,6 +80,23 @@ def test_字幕宽度跟着内容更新(clock, setup_session):
     assert long_w > short_w, f"40 个字没比 1 个字宽（{long_w} vs {short_w}）"
 
 
+def test_显示风格可以切换(clock):
+    """像素风格是可选模式，两个方向都要能切，且切完要恢复原样。
+
+    设备端的字模是自己画的 5×7 点阵 —— 液晶没人能自动判断好不好看，
+    所以这里只验证状态机（切换生效、能切回），视觉效果得人眼看。
+    """
+    original = clock.status()["style"]
+
+    assert clock.send("M1").strip() == "ok"
+    assert clock.status()["style"] == "pixel"
+    assert clock.send("M0").strip() == "ok"
+    assert clock.status()["style"] == "classic"
+
+    clock.send("M1" if original == "pixel" else "M0")
+    assert clock.status()["style"] == original
+
+
 def test_堆余量没有被饿死(clock):
     """去掉 WiFi 之后堆宽裕多了，这条守一个下限。
 

@@ -8,6 +8,8 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
 #include <lgfx/Fonts/efont/lgfx_efont_cn.h>
 
@@ -144,6 +146,53 @@ void invalidateClockText() {
   memset(gPrevSecond, 0, sizeof(gPrevSecond));
 }
 
+// ==================== 显示风格 ====================
+
+// 两种表盘风格。像素风只作用于大号的时间和秒 —— 日期是细笔画小字、字幕是中文
+// 点阵字，改成像素风收益低、可读性反而变差。
+enum class DisplayStyle : uint8_t { Classic, Pixel };
+
+constexpr int kStyleCount = 2;
+
+volatile DisplayStyle gStyle = DisplayStyle::Classic;
+// 风格刚变，clockTask 下一轮要整屏重画 —— 两种风格的字号差很多，
+// 只重画变化的字位会留下旧字形的残影
+volatile bool gStyleDirty = false;
+
+// 风格存 NVS，重启后保持。命名空间和键名都很短，NVS 里每个键都占空间。
+constexpr const char* kNvsNamespace = "clock";
+constexpr const char* kNvsStyleKey = "style";
+
+void loadStyle() {
+  nvs_handle_t h;
+  if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK) return;
+  uint8_t v = 0;
+  if (nvs_get_u8(h, kNvsStyleKey, &v) == ESP_OK && v < kStyleCount) {
+    gStyle = v == 0 ? DisplayStyle::Classic : DisplayStyle::Pixel;
+  }
+  nvs_close(h);
+}
+
+void saveStyle() {
+  nvs_handle_t h;
+  if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_set_u8(h, kNvsStyleKey, gStyle == DisplayStyle::Classic ? 0 : 1);
+  nvs_commit(h);
+  nvs_close(h);
+}
+
+void setStyle(DisplayStyle s) {
+  if (s == gStyle) return;
+  gStyle = s;
+  saveStyle();
+  gStyleDirty = true;
+  ESP_LOGI(kTag, "显示风格切到 %s", s == DisplayStyle::Classic ? "classic" : "pixel");
+}
+
+void cycleStyle() {
+  setStyle(gStyle == DisplayStyle::Classic ? DisplayStyle::Pixel : DisplayStyle::Classic);
+}
+
 // 定长字符串按固定字位绘制，且只重画真正变化的字位。
 //
 // 原来每次都是「整块 fillRect 清空 → 重绘」，清完到画完之间有肉眼可见的黑屏，
@@ -196,6 +245,91 @@ void drawSlotString(const lgfx::IFont* font, const char* text, const char* chars
     lcd.drawString(ch, x + (slotW - glyphW) / 2, y);
 
     prev[i] = text[i];
+  }
+}
+
+// ==================== 像素风字形 ====================
+// 5×7 点阵，每行一个字节、低 5 位有效、bit4 在最左。
+// 只收时间用得到的字符：0-9 和冒号。
+//
+// 为什么自己画字模而不是把矢量字体放大：矢量字体放大出来是「圆润的大字」，
+// 不是像素风 —— 像素风的关键是方块边缘和整格对齐。
+static const uint8_t kPixelGlyphs[][7] = {
+    {0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110},  // 0
+    {0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110},  // 1
+    {0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111},  // 2
+    {0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110},  // 3
+    {0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010},  // 4
+    {0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110},  // 5
+    {0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110},  // 6
+    {0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000},  // 7
+    {0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110},  // 8
+    {0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100},  // 9
+    {0b11000, 0b11000, 0b00000, 0b00000, 0b11000, 0b11000, 0b00000},  // :
+};
+
+// 每个字形的实际列数。冒号只要 2 列 —— 按 5 列算会留下两大块空白，
+// 时间被挤窄。2×2 的方点也更像像素画里的冒号。
+static const uint8_t kPixelWidths[] = {5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 2};
+
+const uint8_t* pixelGlyph(char c, int* width) {
+  if (c >= '0' && c <= '9') {
+    *width = kPixelWidths[c - '0'];
+    return kPixelGlyphs[c - '0'];
+  }
+  if (c == ':') {
+    *width = kPixelWidths[10];
+    return kPixelGlyphs[10];
+  }
+  return nullptr;
+}
+
+// 用点阵画定长字符串。block = 一个像素方块的边长。
+//
+// 和 drawSlotString 一样只重画**变化的字位**：整块清空再重画，每秒会闪一次。
+// 也只有这样，"11:11" 这种宽度不同的串才不会左右跳。
+void drawPixelString(const char* text, int y, int block, uint16_t fg, char* prev) {
+  const int len = static_cast<int>(strlen(text));
+  if (len <= 0 || block <= 0) return;
+
+  int widths[8];
+  const int maxLen = static_cast<int>(sizeof(widths) / sizeof(widths[0]));
+  if (len > maxLen) return;
+
+  int cells = 0;
+  for (int i = 0; i < len; ++i) {
+    int w = 0;
+    pixelGlyph(text[i], &w);
+    if (w == 0) w = 5;  // 不认识的字符按 5 列留白
+    widths[i] = static_cast<int8_t>(w);
+    cells += w;
+  }
+
+  const int gap = block;  // 字间留一个方块宽
+  const int totalW = cells * block + gap * (len - 1);
+  const int x0 = (W - totalW) / 2;
+  const int h = 7 * block;
+
+  int x = x0;
+  for (int i = 0; i < len; ++i) {
+    const int slotW = widths[i] * block;
+    if (text[i] != prev[i]) {
+      lcd.fillRect(x, y, slotW, h, COL_BG);
+
+      int w = 0;
+      const uint8_t* g = pixelGlyph(text[i], &w);
+      if (g != nullptr) {
+        for (int row = 0; row < 7; ++row) {
+          for (int col = 0; col < w; ++col) {
+            if (g[row] & (1 << (4 - col))) {
+              lcd.fillRect(x + col * block, y + row * block, block, block, fg);
+            }
+          }
+        }
+      }
+      prev[i] = text[i];
+    }
+    x += slotW + gap;
   }
 }
 
@@ -265,6 +399,14 @@ void drawTicker() {
 void drawTime(int hour, int minute) {
   char buf[8];
   snprintf(buf, sizeof(buf), "%02d:%02d", hour, minute);
+  if (gStyle == DisplayStyle::Pixel) {
+    // "HH:MM" 一共 22 列 + 4 个间隔 = 26 个方块宽；留 4px 边距 → 9px 一块。
+    // 7 行高 = 63px，比分配给时间的 84px 矮，垂直居中。
+    constexpr int kBlock = 9;
+    const int h = 7 * kBlock;
+    drawPixelString(buf, Y_TIME + (H_TIME - h) / 2, kBlock, COL_TIME, gPrevTime);
+    return;
+  }
   drawSlotString(&fonts::FreeSansBold24pt7b, buf, "0123456789:", Y_TIME, H_TIME, COL_TIME,
                  W - 16, gPrevTime);
 }
@@ -272,6 +414,12 @@ void drawTime(int hour, int minute) {
 void drawSecond(int sec) {
   char buf[8];
   snprintf(buf, sizeof(buf), ":%02d", sec);
+  if (gStyle == DisplayStyle::Pixel) {
+    constexpr int kBlock = 4;  // 7 行 × 4 = 28px，正好放进 30px 的秒行
+    const int h = 7 * kBlock;
+    drawPixelString(buf, Y_SECOND + (H_SECOND - h) / 2, kBlock, COL_SECOND, gPrevSecond);
+    return;
+  }
   drawSlotString(&fonts::FreeSans12pt7b, buf, "0123456789:", Y_SECOND, H_SECOND, COL_SECOND, 0,
                  gPrevSecond);
 }
@@ -375,6 +523,11 @@ void bleOnSession(const char* sid, int len) {
   gBleSession[len] = '\0';
 }
 
+void bleOnStyle(char c) {
+  if (c == '1') setStyle(DisplayStyle::Pixel);
+  else if (c == '0') setStyle(DisplayStyle::Classic);
+}
+
 void bleOnState(char c) {
   ClaudeState st = ClaudeState::Done;  // 和原来的 HTTP /state 保持一致：认不出的值算完成
   if (c == 'w') st = ClaudeState::Working;
@@ -429,8 +582,10 @@ int bleStatus(char* buf, int cap) {
 
   const int fullLen = static_cast<int>(strlen(text));
 
-  // 取尾部，并且从 UTF-8 字符边界开始，别把汉字劈成半个
-  constexpr int kTailMax = 80;
+  // 取尾部，并且从 UTF-8 字符边界开始，别把汉字劈成半个。
+  // 56 而不是 80：JSON 里字段多了，MTU 247 时 read 最多回 ~243 字节，
+  // 尾部太长会把整个响应截断。
+  constexpr int kTailMax = 56;
   int tailStart = fullLen > kTailMax ? fullLen - kTailMax : 0;
   while (tailStart < fullLen && (static_cast<unsigned char>(text[tailStart]) & 0xC0) == 0x80) {
     ++tailStart;
@@ -439,11 +594,12 @@ int bleStatus(char* buf, int cap) {
 
   return snprintf(buf, cap,
                   "{\"state\":\"%s\",\"session\":\"%s\",\"active\":%s,\"connected\":%s,"
-                  "\"len\":%d,\"width\":%d,\"limit\":%d,\"free_heap\":%u,"
+                  "\"style\":\"%s\",\"len\":%d,\"width\":%d,\"limit\":%d,\"free_heap\":%u,"
                   "\"largest_block\":%u,\"tail\":\"%s\"}",
                   claudeStateName(st), session, active ? "true" : "false",
-                  connected ? "true" : "false", fullLen, width, W - kTickerIndent,
-                  static_cast<unsigned>(esp_get_free_heap_size()),
+                  connected ? "true" : "false",
+                  gStyle == DisplayStyle::Pixel ? "pixel" : "classic", fullLen, width,
+                  W - kTickerIndent, static_cast<unsigned>(esp_get_free_heap_size()),
                   static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
                   tail);
 }
@@ -476,15 +632,21 @@ void initStorage() {
   gStorageReady = true;
 }
 
-// BOOT 键交给 ESP-IDF 官方按键驱动 iot_button：去抖、单击/连击判定
+// BOOT 键交给 ESP-IDF 官方按键驱动 iot_button：去抖、单击/长按/连击判定
 // 都由库负责，比自己写中断计数可靠，短按也不会漏。
-// 回调在库的任务上下文里跑，这里只累加计数，实际动作交给 clockTask。
+// 回调在库的任务上下文里跑，这里只累加计数 / 置标志，实际动作交给 clockTask。
 volatile uint32_t gButtonClicks = 0;
+
+// 长按 3 秒切换显示风格（经典 / 像素）。3 秒而不是库默认的 1.5 秒 ——
+// 切换虽然无害，但也不该那么容易误触。
+constexpr uint16_t kLongPressStyleMs = 3000;
 
 void onButtonSingleClick(void*, void*) {
   // volatile 上的 ++ 在 C++20 已废弃，显式读改写
   gButtonClicks = gButtonClicks + 1;
 }
+
+void onButtonLongPress(void*, void*) { cycleStyle(); }
 
 // 板子上 GPIO12/13 接着指示灯。这两脚在 ESP32-C3 上默认是内部 flash 的
 // SPIHD/SPIWP，但本板 flash 跑在 DIO 模式（启动日志 "SPI Mode : DIO"，只用
@@ -502,7 +664,7 @@ void initBoardLeds() {
 
 void initButton() {
   button_config_t cfg = {};
-  cfg.long_press_time = 0;   // 0 = 用 Kconfig 默认值（本固件不用长按）
+  cfg.long_press_time = kLongPressStyleMs;
   cfg.short_press_time = 0;
 
   button_gpio_config_t gpioCfg = {};
@@ -517,7 +679,9 @@ void initButton() {
     return;
   }
   iot_button_register_cb(btn, BUTTON_SINGLE_CLICK, nullptr, onButtonSingleClick, nullptr);
-  ESP_LOGI(kTag, "BOOT 键 gpio%d 就绪（短按播放 GIF）", static_cast<int>(kBootPin));
+  iot_button_register_cb(btn, BUTTON_LONG_PRESS_START, nullptr, onButtonLongPress, nullptr);
+  ESP_LOGI(kTag, "BOOT 键 gpio%d 就绪（短按播放 GIF，长按 %ums 切换显示风格）",
+           static_cast<int>(kBootPin), kLongPressStyleMs);
 }
 
 // ==================== 定时提醒 ====================
@@ -586,6 +750,16 @@ void clockTask(void*) {
     struct tm t;
     localtime_r(&now, &t);
 
+    // 显示风格刚被切换（BOOT 长按或 BLE 指令）：整屏清掉重画。
+    // 两种风格的字号差很多，只重画变化的字位会留下旧字形的残影。
+    if (gStyleDirty) {
+      gStyleDirty = false;
+      lcd.fillScreen(COL_BG);
+      invalidateClockText();
+      lastHour = lastMinute = lastSecond = lastDay = -1;
+      redrawTopRow();
+    }
+
     // BOOT 键：库回调累加计数，这里消费
     static uint32_t handledClicks = 0;
     if (gButtonClicks != handledClicks) {
@@ -648,6 +822,17 @@ void clockTask(void*) {
 }  // namespace
 
 extern "C" void app_main(void) {
+  // NVS 要最先初始化：显示风格存在里面，NimBLE 内部也可能用
+  esp_err_t nvsErr = nvs_flash_init();
+  if (nvsErr == ESP_ERR_NVS_NO_FREE_PAGES || nvsErr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    nvsErr = nvs_flash_init();
+  }
+  if (nvsErr != ESP_OK) {
+    ESP_LOGW(kTag, "NVS 初始化失败（%s），显示风格将不会保存", esp_err_to_name(nvsErr));
+  }
+  loadStyle();
+
   // 不主动驱动 TFT_BL：不接该引脚屏幕也正常点亮，说明背光由硬件自行处理
   // （接 VCC 或默认导通），软件干预反而可能关掉它（实测拉高后全黑）
   ESP_LOGI(kTag, "TFT_BL=gpio%d 交由硬件处理，软件不驱动", TFT_BL);
@@ -689,6 +874,7 @@ extern "C" void app_main(void) {
   cb.state = bleOnState;
   cb.time = bleOnTime;
   cb.session = bleOnSession;
+  cb.style = bleOnStyle;
   cb.status = bleStatus;
   bleClockSetCallbacks(cb);
 

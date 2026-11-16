@@ -49,6 +49,7 @@ static void startAdvertising();
 //   'S' 状态（body[0] = 'w'/'d'/'f'）
 //   'T' 时间（body 4 字节小端 Unix epoch 秒，UTC）
 //   'I' 会话标识
+//   'M' 显示风格（body[0] = '0' 经典 / '1' 像素）
 //   'Q' 查询（状态走 STATUS 的 read，这里不用做事）
 static void handleCommand(const uint8_t* data, int len) {
   if (len <= 0) return;
@@ -75,6 +76,9 @@ static void handleCommand(const uint8_t* data, int len) {
       break;
     case 'I':
       if (gCb.session) gCb.session(body, bodyLen);
+      break;
+    case 'M':
+      if (bodyLen >= 1 && gCb.style) gCb.style(body[0]);
       break;
     case 'Q':
       break;
