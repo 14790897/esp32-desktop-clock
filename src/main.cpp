@@ -86,13 +86,15 @@ constexpr uint16_t COL_WAIT = 0xFD20;
 // ==================== 版面 ====================
 // 顶部字幕行用 24px 点阵字库放大 2 倍（见 kTickerScale），行高 50。
 // 放大后可见汉字从约 10 个降到约 5 个 —— 这是用户选的取舍。
-constexpr int Y_STATUS = 6;
+//
+// 纵向把 240px 用满：底部只剩 4px，余量匀到了各段间距里（原来底部空了 26px）。
+constexpr int Y_STATUS = 10;
 constexpr int H_STATUS = 50;
-constexpr int Y_TIME = 60;
+constexpr int Y_TIME = 70;
 constexpr int H_TIME = 84;
-constexpr int Y_SECOND = 150;
+constexpr int Y_SECOND = 166;
 constexpr int H_SECOND = 30;
-constexpr int Y_DATE = 188;
+constexpr int Y_DATE = 210;
 constexpr int H_DATE = 26;
 
 // ==================== Claude 输出字幕 ====================
