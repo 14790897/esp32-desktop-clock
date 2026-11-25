@@ -110,6 +110,15 @@ constexpr int kTickerIndent = 4;        // 右侧留白
 // 字幕字号倍数。字库只有 10/12/14/16/24 这几档、没有 32，所以放大器只能整数倍 ——
 // 非整数倍（比如 1.5）对点阵字会得到粗细不均的锯齿。2 倍后每字 48px、可见约 5 个汉字。
 constexpr int kTickerScale = 2;
+
+// 顶部那行显不显示 Claude 的文字。
+//
+// false = 只用一个彩色圆点表示状态（黄 工作中 / 绿 完成 / 红 出错），不看文字。
+// 文字仍在后面照常接收（BLE 状态里能读到），只是不画出来 —— 改 true 即可恢复回显。
+constexpr bool kShowTickerText = false;
+
+// 状态圆点半径。行高 50，10px 半径看着比较醒目。
+constexpr int kStatusDotRadius = 10;
 constexpr uint16_t COL_BUSY = 0xFD20;   // 工作中：琥珀
 constexpr uint16_t COL_DONE = 0x07E0;   // 已完成：绿
 constexpr uint16_t COL_FAIL = 0xF800;   // 出错中断：红
@@ -352,7 +361,7 @@ void drawStatus(uint16_t color, const char* msg) {
     // 垂直居中：行高随字幕放大到 50，写死 y 会贴在顶上
     lcd.drawCenterString(msg, W / 2, Y_STATUS + (H_STATUS - lcd.fontHeight()) / 2);
   } else {
-    lcd.fillCircle(W / 2, Y_STATUS + H_STATUS / 2, 6, color);
+    lcd.fillCircle(W / 2, Y_STATUS + H_STATUS / 2, kStatusDotRadius, color);
   }
 }
 
@@ -395,12 +404,15 @@ void drawTicker() {
 #endif
 
   gTickerSprite.fillRect(0, 0, W, H_STATUS, COL_BG);
-  if (gTickerActive) {
+  if (kShowTickerText && gTickerActive) {
     gTickerSprite.setFont(&fonts::efontCN_24);
     gTickerSprite.setTextSize(static_cast<float>(kTickerScale));
     gTickerSprite.setTextColor(forSprite(claudeColor()));
     gTickerSprite.drawString(gTickerText, W - kTickerIndent - gTickerTextW,
                              (H_STATUS - 24 * kTickerScale) / 2);
+  } else {
+    // 不显示文字时整行就一个状态灯：黄 工作中 / 绿 完成 / 红 出错 / 灰 还没跑过
+    gTickerSprite.fillCircle(W / 2, H_STATUS / 2, kStatusDotRadius, forSprite(claudeColor()));
   }
   gTickerSprite.pushSprite(0, Y_STATUS);
 }
@@ -544,8 +556,9 @@ void bleOnState(char c) {
 
   if (xSemaphoreTake(gTickerLock, pdMS_TO_TICKS(50)) == pdTRUE) {
     gClaudeState = st;
-    // 状态只影响颜色不改文字，但同样得触发重画，否则颜色会停在旧值
-    if (gTickerActive) gTickerDirty = true;
+    // 状态只影响颜色不改文字，但同样得触发重画，否则颜色会停在旧值。
+    // 不显示文字时这条更要紧 —— 圆点是唯一的状态指示。
+    gTickerDirty = true;
     xSemaphoreGive(gTickerLock);
   }
 }
