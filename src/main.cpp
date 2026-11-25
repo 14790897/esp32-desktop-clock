@@ -721,7 +721,8 @@ void redrawTopRow() {
     // 尾巴对齐，位置由内容宽度决定，GIF/提醒占屏后不需要复位什么，直接重画
     drawTicker();
   } else if (timeIsValid()) {
-    drawStatus(COL_OK, nullptr);
+    // 圆点用 Claude 的状态色，而不是写死绿色 —— 还没跑过时应该是灰的
+    drawStatus(claudeColor(), nullptr);
   } else {
     drawStatus(COL_WAIT, "wait BLE");
   }
@@ -779,6 +780,14 @@ void clockTask(void*) {
       lcd.fillScreen(COL_BG);
       invalidateClockText();
       lastHour = lastMinute = lastSecond = lastDay = -1;
+      redrawTopRow();
+    }
+
+    // 第一次拿到时间：顶部那行要从「wait BLE」换成状态灯。
+    // 之前这里没人管，结果是开机后一直停在 wait BLE，直到 Claude 第一次输出。
+    static bool topRowSettled = false;
+    if (!topRowSettled) {
+      topRowSettled = true;
       redrawTopRow();
     }
 
