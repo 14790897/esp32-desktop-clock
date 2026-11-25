@@ -117,8 +117,8 @@ constexpr int kTickerScale = 2;
 // 文字仍在后面照常接收（BLE 状态里能读到），只是不画出来 —— 改 true 即可恢复回显。
 constexpr bool kShowTickerText = false;
 
-// 状态圆点半径。行高 50，10px 半径看着比较醒目。
-constexpr int kStatusDotRadius = 10;
+// 状态圆点半径。行高 50，18px 半径 = 36px 直径，上下各留 7px。
+constexpr int kStatusDotRadius = 18;
 constexpr uint16_t COL_BUSY = 0xFD20;   // 工作中：琥珀
 constexpr uint16_t COL_DONE = 0x07E0;   // 已完成：绿
 constexpr uint16_t COL_FAIL = 0xF800;   // 出错中断：红
