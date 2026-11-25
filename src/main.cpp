@@ -84,13 +84,15 @@ constexpr uint16_t COL_OK = 0x07E0;
 constexpr uint16_t COL_WAIT = 0xFD20;
 
 // ==================== 版面 ====================
-constexpr int Y_STATUS = 10;
-constexpr int H_STATUS = 26;
-constexpr int Y_TIME = 44;
+// 顶部字幕行用 24px 点阵字库放大 2 倍（见 kTickerScale），行高 50。
+// 放大后可见汉字从约 10 个降到约 5 个 —— 这是用户选的取舍。
+constexpr int Y_STATUS = 6;
+constexpr int H_STATUS = 50;
+constexpr int Y_TIME = 60;
 constexpr int H_TIME = 84;
-constexpr int Y_SECOND = 138;
+constexpr int Y_SECOND = 150;
 constexpr int H_SECOND = 30;
-constexpr int Y_DATE = 184;
+constexpr int Y_DATE = 188;
 constexpr int H_DATE = 26;
 
 // ==================== Claude 输出字幕 ====================
@@ -103,6 +105,9 @@ constexpr int H_DATE = 26;
 
 constexpr int kTickerCap = 1024;        // 文字缓冲上限（字节），满了从前面丢
 constexpr int kTickerIndent = 4;        // 右侧留白
+// 字幕字号倍数。字库只有 10/12/14/16/24 这几档、没有 32，所以放大器只能整数倍 ——
+// 非整数倍（比如 1.5）对点阵字会得到粗细不均的锯齿。2 倍后每字 48px、可见约 5 个汉字。
+constexpr int kTickerScale = 2;
 constexpr uint16_t COL_BUSY = 0xFD20;   // 工作中：琥珀
 constexpr uint16_t COL_DONE = 0x07E0;   // 已完成：绿
 constexpr uint16_t COL_FAIL = 0xF800;   // 出错中断：红
@@ -340,11 +345,12 @@ void drawStatus(uint16_t color, const char* msg) {
   lcd.fillRect(0, Y_STATUS, W, H_STATUS, COL_BG);
   if (msg) {
     lcd.setFont(&fonts::FreeSans9pt7b);
-    lcd.setTextSize(1.0f);
+    lcd.setTextSize(static_cast<float>(kTickerScale));
     lcd.setTextColor(color, COL_BG);
-    lcd.drawCenterString(msg, W / 2, Y_STATUS);
+    // 垂直居中：行高随字幕放大到 50，写死 y 会贴在顶上
+    lcd.drawCenterString(msg, W / 2, Y_STATUS + (H_STATUS - lcd.fontHeight()) / 2);
   } else {
-    lcd.fillCircle(W / 2, Y_STATUS + H_STATUS / 2, 4, color);
+    lcd.fillCircle(W / 2, Y_STATUS + H_STATUS / 2, 6, color);
   }
 }
 
@@ -389,9 +395,10 @@ void drawTicker() {
   gTickerSprite.fillRect(0, 0, W, H_STATUS, COL_BG);
   if (gTickerActive) {
     gTickerSprite.setFont(&fonts::efontCN_24);
-    gTickerSprite.setTextSize(1.0f);
+    gTickerSprite.setTextSize(static_cast<float>(kTickerScale));
     gTickerSprite.setTextColor(forSprite(claudeColor()));
-    gTickerSprite.drawString(gTickerText, W - kTickerIndent - gTickerTextW, (H_STATUS - 24) / 2);
+    gTickerSprite.drawString(gTickerText, W - kTickerIndent - gTickerTextW,
+                             (H_STATUS - 24 * kTickerScale) / 2);
   }
   gTickerSprite.pushSprite(0, Y_STATUS);
 }
@@ -701,7 +708,7 @@ void redrawTopRow() {
   } else if (timeIsValid()) {
     drawStatus(COL_OK, nullptr);
   } else {
-    drawStatus(COL_WAIT, "waiting for BLE...");
+    drawStatus(COL_WAIT, "wait BLE");
   }
 }
 
@@ -717,7 +724,7 @@ void refreshTicker() {
 
   xSemaphoreTake(gTickerLock, portMAX_DELAY);
   lcd.setFont(&fonts::efontCN_24);
-  lcd.setTextSize(1.0f);
+  lcd.setTextSize(static_cast<float>(kTickerScale));
   gTickerTextW = lcd.textWidth(gTickerText);
   gTickerDirty = false;
   xSemaphoreGive(gTickerLock);
